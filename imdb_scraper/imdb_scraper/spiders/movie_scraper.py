@@ -20,11 +20,9 @@ class ImdbSpider(scrapy.Spider):
         self.movies_scraped = 0
         self.seen_movie_ids = set()
 
-    # browser user agent
+    # browser user agent - removed concurrency overrides to use settings.py values
     custom_settings = {
         'USER_AGENT': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'CONCURRENT_REQUESTS': 2,
-        'DOWNLOAD_DELAY': 1,
     }
 
     def start_requests(self):
@@ -43,7 +41,8 @@ class ImdbSpider(scrapy.Spider):
                     'playwright': True,
                     'playwright_include_page': False,
                     'playwright_page_goto_kwargs': {
-                        'wait_until': 'networkidle',
+                        'wait_until': 'domcontentloaded',  # Faster than networkidle
+                        'timeout': 30000,
                     },
                 }
             )
@@ -107,7 +106,12 @@ class ImdbSpider(scrapy.Spider):
 
             self.movies_scraped += 1
             full_url = response.urljoin(link)
-            yield scrapy.Request(full_url, callback=self.parse_movie)
+            # Movie pages don't need Playwright - use regular request for speed
+            yield scrapy.Request(
+                full_url,
+                callback=self.parse_movie,
+                meta={'playwright': False}
+            )
 
     def parse_movie(self, response):
         item = MovieItem()
@@ -143,8 +147,8 @@ class ImdbSpider(scrapy.Spider):
         else:
             item['user_score'] = None
 
-        # box office not on main page
-        item['box_office'] = None
+        # get box office (worldwide gross)
+        item['box_office'] = self._extract_box_office(response)
 
         # get genres list
         genres = response.css('div.ipc-chip-list__scroller a span::text').getall()
@@ -162,7 +166,7 @@ class ImdbSpider(scrapy.Spider):
 
         yield item
 
-        # follow to reviews page
+        # follow to reviews page (no Playwright needed)
         full_tt_match = re.search(r'(tt\d+)', response.url)
         if full_tt_match:
             full_tt_id = full_tt_match.group(1)
@@ -170,8 +174,44 @@ class ImdbSpider(scrapy.Spider):
             yield scrapy.Request(
                 reviews_url,
                 callback=self.parse_reviews,
-                meta={'movie_id': movie_id}
+                meta={'movie_id': movie_id, 'playwright': False}
             )
+
+    def _extract_box_office(self, response):
+        """Extract worldwide gross box office from movie page."""
+        # Try to find the box office section
+        # Look for "Gross worldwide" or "Worldwide Gross" label
+        box_office_value = None
+
+        # Method 1: Look in the box office section by data-testid
+        box_office_section = response.xpath(
+            '//li[@data-testid="title-boxoffice-cumulativeworldwidegross"]'
+            '//span[contains(@class, "ipc-metadata-list-item__list-content-item")]/text()'
+        ).get()
+
+        if box_office_section:
+            box_office_value = box_office_section
+
+        # Method 2: Fallback - look for any element containing gross worldwide
+        if not box_office_value:
+            box_office_value = response.xpath(
+                '//span[contains(text(), "Gross worldwide")]/following-sibling::span/text()'
+            ).get()
+
+        # Method 3: Another fallback pattern
+        if not box_office_value:
+            box_office_value = response.xpath(
+                '//li[contains(., "Gross worldwide")]//span[@class="ipc-metadata-list-item__list-content-item"]/text()'
+            ).get()
+
+        if box_office_value:
+            # Parse the value - remove currency symbol and convert to integer
+            # e.g., "$2,923,706,026" -> 2923706026
+            cleaned = re.sub(r'[^\d]', '', box_office_value)
+            if cleaned:
+                return int(cleaned)
+
+        return None
 
     def _extract_directors(self, response):
         directors = []

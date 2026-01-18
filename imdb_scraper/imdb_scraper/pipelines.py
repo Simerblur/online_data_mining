@@ -54,6 +54,8 @@ class SqlitePipeline:
         output_dir.mkdir(exist_ok=True)
         self.connection = sqlite3.connect(output_dir / 'movies.db')
         self.cursor = self.connection.cursor()
+        # enable foreign key enforcement
+        self.cursor.execute('PRAGMA foreign_keys = ON')
         self._create_tables()
 
     def _create_tables(self):

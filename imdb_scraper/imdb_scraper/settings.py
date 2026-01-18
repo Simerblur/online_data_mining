@@ -19,15 +19,15 @@ ADDONS = {}
 #USER_AGENT = "imdb_scraper (+http://www.yourdomain.com)"
 
 # Obey robots.txt rules
-ROBOTSTXT_OBEY = True
+ROBOTSTXT_OBEY = False  # Disabled for scraping (using proxies)
 
-# Concurrency and throttling settings
-#CONCURRENT_REQUESTS = 16
-CONCURRENT_REQUESTS_PER_DOMAIN = 1
-DOWNLOAD_DELAY = 2
+# Concurrency and throttling settings - optimized for Playwright + proxies
+CONCURRENT_REQUESTS = 8  # Increased from default
+CONCURRENT_REQUESTS_PER_DOMAIN = 4  # Allow more concurrent requests to IMDb
+DOWNLOAD_DELAY = 0.5  # Reduced delay (proxies handle rate limiting)
 
-# Disable cookies (enabled by default)
-#COOKIES_ENABLED = False
+# Disable cookies to reduce bandwidth
+COOKIES_ENABLED = False
 
 # Disable Telnet Console (enabled by default)
 #TELNETCONSOLE_ENABLED = False
@@ -63,18 +63,27 @@ ITEM_PIPELINES = {
     "imdb_scraper.pipelines.SqlitePipeline": 400,
 }
 
-# Enable and configure the AutoThrottle extension (disabled by default)
-# See https://docs.scrapy.org/en/latest/topics/autothrottle.html
-#AUTOTHROTTLE_ENABLED = True
-# The initial download delay
-#AUTOTHROTTLE_START_DELAY = 5
-# The maximum download delay to be set in case of high latencies
-#AUTOTHROTTLE_MAX_DELAY = 60
-# The average number of requests Scrapy should be sending in parallel to
-# each remote server
-#AUTOTHROTTLE_TARGET_CONCURRENCY = 1.0
-# Enable showing throttling stats for every response received:
-#AUTOTHROTTLE_DEBUG = False
+# Enable and configure the AutoThrottle extension
+# Automatically adjusts delay based on server response times
+AUTOTHROTTLE_ENABLED = True
+AUTOTHROTTLE_START_DELAY = 0.5
+AUTOTHROTTLE_MAX_DELAY = 10
+AUTOTHROTTLE_TARGET_CONCURRENCY = 4.0  # Target concurrent requests per server
+AUTOTHROTTLE_DEBUG = False
+
+# Retry settings - reduce wasted time on failed requests
+RETRY_ENABLED = True
+RETRY_TIMES = 2  # Reduced from default 3
+RETRY_HTTP_CODES = [500, 502, 503, 504, 408, 429]
+
+# DNS caching for faster lookups
+DNSCACHE_ENABLED = True
+DNSCACHE_SIZE = 10000
+
+# Reduce memory usage
+DEPTH_PRIORITY = 1  # BFS instead of DFS
+SCHEDULER_DISK_QUEUE = 'scrapy.squeues.PickleFifoDiskQueue'
+SCHEDULER_MEMORY_QUEUE = 'scrapy.squeues.FifoMemoryQueue'
 
 # Enable and configure HTTP caching (disabled by default)
 # See https://docs.scrapy.org/en/latest/topics/downloader-middleware.html#httpcache-middleware-settings
@@ -111,5 +120,27 @@ PLAYWRIGHT_LAUNCH_OPTIONS = {
         "username": BRIGHTDATA_USER,
         "password": BRIGHTDATA_PASS,
     },
+    # Performance optimizations
+    "args": [
+        "--disable-gpu",
+        "--disable-dev-shm-usage",
+        "--disable-setuid-sandbox",
+        "--no-sandbox",
+        "--disable-extensions",
+    ],
 }
-PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT = 60000
+PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT = 30000  # Reduced from 60s to 30s
+
+# Playwright context options - block unnecessary resources
+PLAYWRIGHT_CONTEXTS = {
+    "default": {
+        "ignore_https_errors": True,
+        "java_script_enabled": True,
+    }
+}
+
+# Max pages per browser context (memory optimization)
+PLAYWRIGHT_MAX_PAGES_PER_CONTEXT = 4
+
+# Abort unnecessary requests to save bandwidth and speed up scraping
+PLAYWRIGHT_ABORT_REQUEST = lambda req: req.resource_type in ["image", "media", "font", "stylesheet"]
