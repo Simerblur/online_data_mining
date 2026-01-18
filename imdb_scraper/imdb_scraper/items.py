@@ -1,24 +1,28 @@
-# Define here the models for your scraped items
-#
-# See documentation in:
-# https://docs.scrapy.org/en/latest/topics/items.html
+# scrapy item definitions for imdb scraper
 
 import scrapy
 
 
+# movie data from imdb
 class MovieItem(scrapy.Item):
-    """Item representing a movie from IMDb Top 250."""
-    title = scrapy.Field()
-    year = scrapy.Field()
-    runtime_minutes = scrapy.Field()
-    rating = scrapy.Field()
-    metascore = scrapy.Field()
-    user_score = scrapy.Field()
-    budget = scrapy.Field()
-    box_office = scrapy.Field()
-    plot = scrapy.Field()
-    genres = scrapy.Field()
-    director = scrapy.Field()
-    studio = scrapy.Field()
-    imdb_id = scrapy.Field()
-    scraped_at = scrapy.Field()
+    movie_id = scrapy.Field()      # imdb numeric id
+    title = scrapy.Field()         # movie title
+    year = scrapy.Field()          # release year
+    user_score = scrapy.Field()    # imdb rating
+    box_office = scrapy.Field()    # gross revenue
+    genres = scrapy.Field()        # comma separated genres
+    genres_list = scrapy.Field()   # list for normalization
+    directors = scrapy.Field()     # list of director dicts
+    cast = scrapy.Field()          # list of actor dicts
+    scraped_at = scrapy.Field()    # scrape timestamp
+
+
+# user review from imdb
+class ReviewItem(scrapy.Item):
+    movie_id = scrapy.Field()      # foreign key to movie
+    author = scrapy.Field()        # reviewer username
+    score = scrapy.Field()         # rating given
+    text = scrapy.Field()          # review content
+    is_critic = scrapy.Field()     # critic or user
+    review_date = scrapy.Field()   # date posted
+    scraped_at = scrapy.Field()    # scrape timestamp

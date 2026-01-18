@@ -86,3 +86,30 @@ ITEM_PIPELINES = {
 
 # Set settings whose default value is deprecated to a future-proof value
 FEED_EXPORT_ENCODING = "utf-8"
+
+# Bright Data residential proxy settings
+BRIGHTDATA_USER = "brd-customer-hl_79cc5ce7-zone-group4"
+BRIGHTDATA_PASS = "8xizh8sdpkq9"
+BRIGHTDATA_HOST = "brd.superproxy.io"
+BRIGHTDATA_PORT = "33335"
+
+PROXY_URL = f"http://{BRIGHTDATA_USER}:{BRIGHTDATA_PASS}@{BRIGHTDATA_HOST}:{BRIGHTDATA_PORT}"
+
+# Playwright settings for JavaScript rendering
+DOWNLOAD_HANDLERS = {
+    "http": "scrapy_playwright.handler.ScrapyPlaywrightDownloadHandler",
+    "https": "scrapy_playwright.handler.ScrapyPlaywrightDownloadHandler",
+}
+
+TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
+
+PLAYWRIGHT_BROWSER_TYPE = "chromium"
+PLAYWRIGHT_LAUNCH_OPTIONS = {
+    "headless": True,
+    "proxy": {
+        "server": f"http://{BRIGHTDATA_HOST}:{BRIGHTDATA_PORT}",
+        "username": BRIGHTDATA_USER,
+        "password": BRIGHTDATA_PASS,
+    },
+}
+PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT = 60000
