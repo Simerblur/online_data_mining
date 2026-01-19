@@ -66,6 +66,8 @@ class ImdbScraperDownloaderMiddleware:
         return s
 
     def process_request(self, request, spider):
+        # Use Bright Data proxy for every request (also for Metacritic)
+        request.meta["proxy"] = spider.settings.get("PROXY_URL")
         # Called for each request that goes through the downloader
         # middleware.
 
