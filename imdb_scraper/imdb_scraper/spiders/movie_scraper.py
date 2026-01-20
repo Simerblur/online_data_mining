@@ -41,8 +41,8 @@ class ImdbSpider(scrapy.Spider):
                     'playwright': True,
                     'playwright_include_page': False,
                     'playwright_page_goto_kwargs': {
-                        'wait_until': 'domcontentloaded',  # Faster than networkidle
-                        'timeout': 30000,
+                        'wait_until': 'domcontentloaded',
+                        'timeout': 120000,  # 2 minutes for proxy connections
                     },
                 }
             )

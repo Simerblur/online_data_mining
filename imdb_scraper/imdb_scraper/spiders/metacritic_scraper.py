@@ -11,6 +11,9 @@ This spider yields ERD items:
 - production_company + movie_production_company
 - award_org + movie_award_summary (best-effort)
 
+Updated: Now reads movies from IMDB SQLite database and searches Metacritic
+to match them, using IMDB movie_id as foreign key.
+
 Author: Jeffrey | Online Data Mining - Amsterdam UAS.
 """
 
@@ -20,14 +23,23 @@ import json
 # re is used for regex patterns like slug, numbers, and dates.
 import re
 
+# sqlite3 is used to read IMDB movies from the database.
+import sqlite3
+
 # zlib is used to create stable numeric IDs from text keys.
 import zlib
 
 # datetime is used for scraped_at timestamps.
 from datetime import datetime
 
+# pathlib is used for file paths.
+from pathlib import Path
+
 # typing is only used to make the code easier to read.
 from typing import Any, Dict, List, Optional, Tuple
+
+# urllib is used to encode search queries.
+from urllib.parse import quote
 
 # Scrapy is our crawler framework.
 import scrapy
@@ -87,6 +99,10 @@ class MetacriticSpider(scrapy.Spider):
         use_playwright_on_browse: str = "true",
         # Use Playwright on detail pages if blocked.
         use_playwright_on_detail: str = "false",
+        # NEW: Use IMDB movies from database instead of browsing Metacritic.
+        use_imdb_source: str = "true",
+        # NEW: Path to IMDB SQLite database.
+        imdb_db_path: str = "",
         *args,
         **kwargs,
     ):
@@ -105,6 +121,25 @@ class MetacriticSpider(scrapy.Spider):
         # Parse playwright flags.
         self.use_playwright_on_browse = str(use_playwright_on_browse).lower() == "true"
         self.use_playwright_on_detail = str(use_playwright_on_detail).lower() == "true"
+
+        # NEW: Parse IMDB source flag.
+        self.use_imdb_source = str(use_imdb_source).lower() == "true"
+
+        # NEW: Set IMDB database path (auto-detect if not provided).
+        if imdb_db_path:
+            self.imdb_db_path = Path(imdb_db_path)
+        else:
+            # Auto-detect: look in common locations.
+            possible_paths = [
+                Path("output/movies.db"),
+                Path("../output/movies.db"),
+                Path.cwd() / "output" / "movies.db",
+            ]
+            self.imdb_db_path = None
+            for p in possible_paths:
+                if p.exists():
+                    self.imdb_db_path = p
+                    break
 
         # Track number of scraped movies.
         self.movies_scraped = 0
@@ -136,6 +171,12 @@ class MetacriticSpider(scrapy.Spider):
             # Stop here to avoid browsing.
             return
 
+        # NEW: If use_imdb_source is enabled, read movies from IMDB database.
+        if self.use_imdb_source and self.imdb_db_path and self.imdb_db_path.exists():
+            self.logger.info(f"Reading IMDB movies from: {self.imdb_db_path}")
+            yield from self._start_requests_from_imdb()
+            return
+
         # Otherwise scrape from browse pages.
         base_url = "https://www.metacritic.com/browse/movie/?page={}"
 
@@ -151,6 +192,198 @@ class MetacriticSpider(scrapy.Spider):
                 meta=self._browse_meta(),
                 priority=10,
             )
+
+    def _start_requests_from_imdb(self):
+        """Read movies from IMDB SQLite database and go directly to Metacritic movie pages."""
+        conn = sqlite3.connect(self.imdb_db_path)
+        cursor = conn.cursor()
+
+        # Get movies from IMDB database.
+        cursor.execute("""
+            SELECT movie_id, title, year
+            FROM movie
+            ORDER BY movie_id
+            LIMIT ?
+        """, (self.max_movies,))
+
+        movies = cursor.fetchall()
+        conn.close()
+
+        self.logger.info(f"Found {len(movies)} IMDB movies to fetch from Metacritic")
+
+        for imdb_movie_id, title, year in movies:
+            # Skip if already processed.
+            if imdb_movie_id in self.seen_slugs:
+                continue
+
+            # Convert title to Metacritic slug format.
+            # "The Dark Knight" -> "the-dark-knight"
+            slug = self._title_to_slug(title)
+
+            if not slug:
+                self.logger.warning(f"Could not create slug for: {title}")
+                continue
+
+            # Mark as seen to avoid duplicates.
+            self.seen_slugs.add(slug)
+
+            # Go directly to the movie page (no search needed).
+            movie_url = f"https://www.metacritic.com/movie/{slug}/"
+
+            self.logger.info(f"Fetching Metacritic: {title} ({year}) -> {slug}")
+
+            yield scrapy.Request(
+                url=movie_url,
+                callback=self.parse_movie,
+                meta={
+                    **self._detail_meta(),
+                    "imdb_movie_id": imdb_movie_id,
+                    "imdb_title": title,
+                    "imdb_year": year,
+                },
+                priority=20,
+                # Don't fail on 404 - movie might not exist on Metacritic.
+                errback=self._handle_movie_error,
+            )
+
+    def _title_to_slug(self, title: str) -> Optional[str]:
+        """Convert movie title to Metacritic URL slug format."""
+        if not title:
+            return None
+
+        # Convert to lowercase.
+        slug = title.lower()
+
+        # Remove common prefixes/suffixes that Metacritic might strip.
+        # e.g., "The Godfather" -> "godfather" on some sites, but Metacritic keeps "the".
+
+        # Replace special characters with spaces.
+        slug = re.sub(r'[^\w\s-]', ' ', slug)
+
+        # Replace multiple spaces with single space.
+        slug = re.sub(r'\s+', ' ', slug).strip()
+
+        # Replace spaces with hyphens.
+        slug = slug.replace(' ', '-')
+
+        # Remove multiple consecutive hyphens.
+        slug = re.sub(r'-+', '-', slug)
+
+        # Remove leading/trailing hyphens.
+        slug = slug.strip('-')
+
+        return slug if slug else None
+
+    def _handle_movie_error(self, failure):
+        """Handle errors when fetching movie pages (e.g., 404 not found)."""
+        request = failure.request
+        imdb_title = request.meta.get("imdb_title", "Unknown")
+        imdb_year = request.meta.get("imdb_year", "")
+        self.logger.warning(f"Failed to fetch Metacritic page for: {imdb_title} ({imdb_year}) - {failure.value}")
+
+    def parse_search_results(self, response):
+        """Parse Metacritic search results and find best match for IMDB movie."""
+        imdb_movie_id = response.meta.get("imdb_movie_id")
+        imdb_title = response.meta.get("imdb_title", "")
+        imdb_year = response.meta.get("imdb_year")
+
+        self.logger.info(f"Searching Metacritic for: {imdb_title} ({imdb_year}) [IMDB: {imdb_movie_id}]")
+
+        # Find movie links in search results.
+        # Metacritic search returns links like /movie/the-dark-knight/
+        movie_links = response.css('a[href^="/movie/"]::attr(href)').getall() or []
+
+        # Also try to extract from JSON in page (Metacritic uses JSON data).
+        page_text = response.text
+
+        # Look for movie slugs in the page.
+        slug_matches = re.findall(r'/movie/([a-z0-9-]+)/?', page_text)
+
+        # Combine and dedupe.
+        all_slugs = []
+        for href in movie_links:
+            slug = self._extract_slug(href)
+            if slug and slug not in all_slugs:
+                all_slugs.append(slug)
+
+        for slug in slug_matches:
+            if slug not in all_slugs and slug not in ("critic-reviews", "user-reviews"):
+                all_slugs.append(slug)
+
+        if not all_slugs:
+            self.logger.warning(f"No Metacritic results found for: {imdb_title} ({imdb_year})")
+            return
+
+        # Try to find best match by comparing slugs to title.
+        best_slug = self._find_best_matching_slug(all_slugs, imdb_title, imdb_year)
+
+        if not best_slug:
+            # Fall back to first result.
+            best_slug = all_slugs[0]
+            self.logger.info(f"Using first result for {imdb_title}: {best_slug}")
+        else:
+            self.logger.info(f"Best match for {imdb_title}: {best_slug}")
+
+        # Skip if already scraped.
+        if best_slug in self.seen_slugs:
+            self.logger.info(f"Already scraped: {best_slug}")
+            return
+
+        self.seen_slugs.add(best_slug)
+        self.movies_scraped += 1
+
+        # Request the movie page.
+        movie_url = f"https://www.metacritic.com/movie/{best_slug}/"
+        yield scrapy.Request(
+            url=movie_url,
+            callback=self.parse_movie,
+            meta={
+                **self._detail_meta(),
+                "imdb_movie_id": imdb_movie_id,
+                "imdb_title": imdb_title,
+                "imdb_year": imdb_year,
+            },
+            priority=30,
+        )
+
+    def _find_best_matching_slug(self, slugs: List[str], title: str, year: Optional[int]) -> Optional[str]:
+        """Find the best matching Metacritic slug for an IMDB title."""
+        if not slugs:
+            return None
+
+        # Normalize title for comparison.
+        title_lower = (title or "").lower()
+        title_words = set(re.findall(r'\w+', title_lower))
+
+        best_score = -1
+        best_slug = None
+
+        for slug in slugs:
+            # Convert slug to words.
+            slug_words = set(slug.replace("-", " ").split())
+
+            # Calculate overlap score.
+            overlap = len(title_words & slug_words)
+            score = overlap
+
+            # Bonus if year is in slug.
+            if year and str(year) in slug:
+                score += 3
+
+            # Bonus for exact title match.
+            slug_as_title = slug.replace("-", " ")
+            if slug_as_title == title_lower:
+                score += 10
+
+            if score > best_score:
+                best_score = score
+                best_slug = slug
+
+        # Only return if we have reasonable confidence.
+        if best_score >= 2:
+            return best_slug
+
+        return None
 
     # -------------------------
     # Browse parsing
@@ -215,8 +448,14 @@ class MetacriticSpider(scrapy.Spider):
         if not slug:
             return
 
-        # Create stable numeric movie_id.
-        movie_id = self._stable_id(f"movie:{slug}")
+        # Use IMDB movie_id if available (from search), otherwise generate hash.
+        imdb_movie_id = response.meta.get("imdb_movie_id")
+        if imdb_movie_id:
+            movie_id = imdb_movie_id
+            self.logger.info(f"Using IMDB movie_id: {movie_id} for {slug}")
+        else:
+            # Fallback to hash-based ID for direct URL scraping.
+            movie_id = self._stable_id(f"movie:{slug}")
 
         # Parse JSON-LD for stable fields if present.
         ld_movie = self._extract_jsonld_movie(response)
@@ -432,7 +671,7 @@ class MetacriticSpider(scrapy.Spider):
         return {
             "playwright": True,
             "playwright_include_page": False,
-            "playwright_page_goto_kwargs": {"wait_until": "domcontentloaded", "timeout": 30000},
+            "playwright_page_goto_kwargs": {"wait_until": "domcontentloaded", "timeout": 120000},
         }
 
     def _detail_meta(self) -> Dict[str, Any]:
@@ -441,7 +680,7 @@ class MetacriticSpider(scrapy.Spider):
         return {
             "playwright": True,
             "playwright_include_page": False,
-            "playwright_page_goto_kwargs": {"wait_until": "domcontentloaded", "timeout": 30000},
+            "playwright_page_goto_kwargs": {"wait_until": "domcontentloaded", "timeout": 120000},
         }
 
     # -------------------------

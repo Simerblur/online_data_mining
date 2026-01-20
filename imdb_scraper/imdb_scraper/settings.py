@@ -11,10 +11,10 @@ ROBOTSTXT_OBEY = False
 COOKIES_ENABLED = False
 FEED_EXPORT_ENCODING = "utf-8"
 
-# Concurrency and throttling
-CONCURRENT_REQUESTS = 8
-CONCURRENT_REQUESTS_PER_DOMAIN = 8
-DOWNLOAD_DELAY = 0.25
+# Concurrency and throttling (reduced for proxy stability)
+CONCURRENT_REQUESTS = 4
+CONCURRENT_REQUESTS_PER_DOMAIN = 4
+DOWNLOAD_DELAY = 1  # 1 second delay between requests
 
 # AutoThrottle
 AUTOTHROTTLE_ENABLED = True
@@ -25,7 +25,7 @@ AUTOTHROTTLE_TARGET_CONCURRENCY = 8.0
 # Retry settings
 RETRY_ENABLED = True
 RETRY_TIMES = 2
-RETRY_HTTP_CODES = [500, 502, 503, 504, 408, 429]
+RETRY_HTTP_CODES = [500, 502, 503, 504, 408, 429, 402]
 
 # DNS and memory
 DNSCACHE_ENABLED = True
@@ -39,12 +39,22 @@ ITEM_PIPELINES = {
     "imdb_scraper.pipelines.SqlitePipeline": 400,
 }
 
-# Bright Data proxy
+# Bright Data proxy configuration
+# Zone type determines the port:
+#   - Datacenter: 22225
+#   - Residential: 22225
+#   - Web Unlocker: 33335
+#   - Scraping Browser: 9515
 BRIGHTDATA_USER = "brd-customer-hl_79cc5ce7-zone-group4"
 BRIGHTDATA_PASS = "8xizh8sdpkq9"
 BRIGHTDATA_HOST = "brd.superproxy.io"
-BRIGHTDATA_PORT = "33335"
-PROXY_URL = f"http://{BRIGHTDATA_USER}:{BRIGHTDATA_PASS}@{BRIGHTDATA_HOST}:{BRIGHTDATA_PORT}"
+BRIGHTDATA_PORT = "33335"  # Web Unlocker port
+
+# Add country targeting (US recommended for IMDB)
+# Append -country-us to username for US IPs
+BRIGHTDATA_USER_WITH_COUNTRY = f"{BRIGHTDATA_USER}-country-us"
+
+PROXY_URL = f"http://{BRIGHTDATA_USER_WITH_COUNTRY}:{BRIGHTDATA_PASS}@{BRIGHTDATA_HOST}:{BRIGHTDATA_PORT}"
 
 # Playwright settings
 DOWNLOAD_HANDLERS = {
@@ -58,13 +68,19 @@ PLAYWRIGHT_LAUNCH_OPTIONS = {
     "headless": True,
     "proxy": {
         "server": f"http://{BRIGHTDATA_HOST}:{BRIGHTDATA_PORT}",
-        "username": BRIGHTDATA_USER,
+        "username": BRIGHTDATA_USER_WITH_COUNTRY,
         "password": BRIGHTDATA_PASS,
     },
     "args": ["--disable-gpu", "--disable-dev-shm-usage", "--no-sandbox", "--disable-extensions"],
 }
-PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT = 90000
-PLAYWRIGHT_CONTEXTS = {"default": {"ignore_https_errors": True, "java_script_enabled": True}}
+PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT = 120000  # 2 minutes for proxy connections
+PLAYWRIGHT_CONTEXTS = {
+    "default": {
+        "ignore_https_errors": True,
+        "java_script_enabled": True,
+        "bypass_csp": True,
+    }
+}
 PLAYWRIGHT_MAX_PAGES_PER_CONTEXT = 8
 PLAYWRIGHT_ABORT_REQUEST = lambda req: req.resource_type in ["image", "media", "font", "stylesheet"]
 
