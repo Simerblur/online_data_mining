@@ -53,18 +53,14 @@ class CsvPipeline:
         if not imdb_path.exists() or imdb_path.stat().st_size == 0:
             self.writer_imdb.writeheader()
 
-        # Metacritic movies CSV (quick debug for your spider)
-        meta_path = output_dir / "movies_metacritic.csv"
+        # Metacritic data CSV (extends movie table)
+        meta_path = output_dir / "metacritic_data.csv"
         self.file_meta = open(meta_path, "a", newline="", encoding="utf-8")
         meta_fields = [
-            "movie_id",
+            "movie_id",  # FK to movie table
             "metacritic_slug",
-            "title_on_site",
-            "release_date",
-            "runtime_minutes",
-            "content_rating",
             "metascore",
-            "user_score",
+            "metacritic_user_score",
             "critic_review_count",
             "user_rating_count",
             "scraped_at",
@@ -95,17 +91,13 @@ class CsvPipeline:
                 "scraped_at": adapter.get("scraped_at"),
             })
 
-        # Write Metacritic movie item (quick check)
+        # Write Metacritic data (linked to movie via movie_id FK)
         if isinstance(item, MetacriticMovieItem):
             self.writer_meta.writerow({
                 "movie_id": adapter.get("movie_id"),
                 "metacritic_slug": adapter.get("metacritic_slug"),
-                "title_on_site": adapter.get("title_on_site"),
-                "release_date": adapter.get("release_date"),
-                "runtime_minutes": adapter.get("runtime_minutes"),
-                "content_rating": adapter.get("content_rating"),
                 "metascore": adapter.get("metascore"),
-                "user_score": adapter.get("user_score"),
+                "metacritic_user_score": adapter.get("user_score"),
                 "critic_review_count": adapter.get("critic_review_count"),
                 "user_rating_count": adapter.get("user_rating_count"),
                 "scraped_at": adapter.get("scraped_at"),
@@ -213,27 +205,28 @@ class SqlitePipeline:
             );
 
             -- =========================================================
-            -- METACRITIC ERD TABLES
+            -- METACRITIC DATA (extends movie table, FK to movie.movie_id)
             -- =========================================================
 
-            CREATE TABLE IF NOT EXISTS metacritic_movie (
-                movie_id INTEGER PRIMARY KEY,
+            -- Metacritic-specific data for movies (1:1 with movie table)
+            CREATE TABLE IF NOT EXISTS metacritic_data (
+                movie_id INTEGER PRIMARY KEY REFERENCES movie(movie_id),
                 metacritic_url TEXT,
                 metacritic_slug VARCHAR(255),
-                title_on_site VARCHAR(255),
-                release_date VARCHAR(50),
-                runtime_minutes INTEGER,
-                content_rating VARCHAR(50),
-                summary TEXT,
+                title_on_metacritic VARCHAR(255),
                 metascore INTEGER,
+                metacritic_user_score DECIMAL(3,1),
                 critic_review_count INTEGER,
-                user_score DECIMAL(3,1),
                 user_rating_count INTEGER,
+                content_rating VARCHAR(50),
+                runtime_minutes INTEGER,
+                summary TEXT,
                 scraped_at DATETIME NOT NULL
             );
 
+            -- Score breakdown (positive/mixed/negative counts)
             CREATE TABLE IF NOT EXISTS metacritic_score_summary (
-                movie_id INTEGER PRIMARY KEY REFERENCES metacritic_movie(movie_id),
+                movie_id INTEGER PRIMARY KEY REFERENCES movie(movie_id),
                 critic_positive_count INTEGER,
                 critic_mixed_count INTEGER,
                 critic_negative_count INTEGER,
@@ -252,7 +245,7 @@ class SqlitePipeline:
 
             CREATE TABLE IF NOT EXISTS metacritic_user_review (
                 user_review_id INTEGER PRIMARY KEY,
-                movie_id INTEGER REFERENCES metacritic_movie(movie_id),
+                movie_id INTEGER REFERENCES movie(movie_id),
                 metacritic_user_id INTEGER REFERENCES metacritic_user(metacritic_user_id),
                 score INTEGER,
                 review_date VARCHAR(50),
@@ -270,7 +263,7 @@ class SqlitePipeline:
 
             CREATE TABLE IF NOT EXISTS metacritic_critic_review (
                 critic_review_id INTEGER PRIMARY KEY,
-                movie_id INTEGER REFERENCES metacritic_movie(movie_id),
+                movie_id INTEGER REFERENCES movie(movie_id),
                 publication_id INTEGER REFERENCES metacritic_publication(publication_id),
                 critic_name VARCHAR(255),
                 score INTEGER,
@@ -289,7 +282,7 @@ class SqlitePipeline:
 
             CREATE TABLE IF NOT EXISTS movie_person_role (
                 movie_person_role_id INTEGER PRIMARY KEY,
-                movie_id INTEGER REFERENCES metacritic_movie(movie_id),
+                movie_id INTEGER REFERENCES movie(movie_id),
                 person_id INTEGER REFERENCES person(person_id),
                 role_type VARCHAR(50),
                 character_name VARCHAR(255),
@@ -304,7 +297,7 @@ class SqlitePipeline:
             );
 
             CREATE TABLE IF NOT EXISTS movie_production_company (
-                movie_id INTEGER REFERENCES metacritic_movie(movie_id),
+                movie_id INTEGER REFERENCES movie(movie_id),
                 production_company_id INTEGER REFERENCES production_company(production_company_id),
                 scraped_at DATETIME NOT NULL,
                 PRIMARY KEY (movie_id, production_company_id)
@@ -319,7 +312,7 @@ class SqlitePipeline:
 
             CREATE TABLE IF NOT EXISTS movie_award_summary (
                 movie_award_summary_id INTEGER PRIMARY KEY,
-                movie_id INTEGER REFERENCES metacritic_movie(movie_id),
+                movie_id INTEGER REFERENCES movie(movie_id),
                 award_org_id INTEGER REFERENCES award_org(award_org_id),
                 wins INTEGER,
                 nominations INTEGER,
@@ -462,26 +455,26 @@ class SqlitePipeline:
     # -------------------------
 
     def _save_metacritic_movie(self, adapter):
+        """Save Metacritic data to metacritic_data table (FK to movie table)."""
         self.cur.execute("""
-            INSERT OR REPLACE INTO metacritic_movie (
-                movie_id, metacritic_url, metacritic_slug, title_on_site, release_date,
-                runtime_minutes, content_rating, summary, metascore, critic_review_count,
-                user_score, user_rating_count, scraped_at
+            INSERT OR REPLACE INTO metacritic_data (
+                movie_id, metacritic_url, metacritic_slug, title_on_metacritic,
+                metascore, metacritic_user_score, critic_review_count, user_rating_count,
+                content_rating, runtime_minutes, summary, scraped_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             adapter.get("movie_id"),
             adapter.get("metacritic_url"),
             adapter.get("metacritic_slug"),
             adapter.get("title_on_site"),
-            adapter.get("release_date"),
-            adapter.get("runtime_minutes"),
-            adapter.get("content_rating"),
-            adapter.get("summary"),
             adapter.get("metascore"),
-            adapter.get("critic_review_count"),
             adapter.get("user_score"),
+            adapter.get("critic_review_count"),
             adapter.get("user_rating_count"),
+            adapter.get("content_rating"),
+            adapter.get("runtime_minutes"),
+            adapter.get("summary"),
             adapter.get("scraped_at"),
         ))
         self.conn.commit()
