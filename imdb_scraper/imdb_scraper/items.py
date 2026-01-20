@@ -1,4 +1,5 @@
-# scrapy item definitions for imdb scraper
+# Author: Juliusz (IMDb items), Jeffrey (Metacritic items), Lin (Box Office items)
+# Online Data Mining - Amsterdam UAS
 
 import scrapy
 
@@ -150,4 +151,15 @@ class ProductionCompanyItem(scrapy.Item):
 class MovieProductionCompanyItem(scrapy.Item):
     movie_id = scrapy.Field()              # PK/FK to movie
     production_company_id = scrapy.Field() # PK/FK to production_company
+    scraped_at = scrapy.Field()            # timestamp
+
+
+# Box Office Mojo data
+class BoxOfficeMojoItem(scrapy.Item):
+    movie_id = scrapy.Field()              # FK to movie (IMDB tt id as int)
+    production_budget = scrapy.Field()     # production budget in dollars
+    domestic_opening = scrapy.Field()      # domestic opening weekend
+    domestic_total = scrapy.Field()        # domestic total gross
+    international_total = scrapy.Field()   # international total gross
+    worldwide_total = scrapy.Field()       # worldwide total gross
     scraped_at = scrapy.Field()            # timestamp

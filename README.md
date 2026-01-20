@@ -6,9 +6,45 @@ Online Data Mining Project for MDDB 2025-2026 at Amsterdam University of Applied
 
 | Name | Responsibility |
 |------|----------------|
-| Juliusz | IMDb scraper: normalized 8-table database schema, movie_scraper.py spider, items.py definitions, pipelines.py with SQLite storage, review/cast/director extraction |
-| Jeffrey | TBD |
-| Lin | TBD |
+| Juliusz | IMDb scraper: infinite scroll pagination, movie/cast/director/review extraction, normalized 8-table schema, CSV/SQLite pipelines, Scrapy settings optimization (proxy config, Playwright integration, concurrency tuning, timeout handling) |
+| Jeffrey | Metacritic scraper: critic/user reviews, metascores, search-based movie matching, slug conversion |
+| Lin | Box Office Mojo scraper: financial data extraction, budget/gross revenue collection, IMDB ID format discovery |
+
+## Key Scraping Strategies
+
+### Anti-Bot Protection (All Scrapers)
+- **Bright Data Web Unlocker Proxy**: Routes all requests through rotating residential IPs with US geo-targeting
+- **Playwright Browser Automation**: Renders JavaScript-heavy pages in headless Chromium
+- **Proxy + Playwright Integration**: Browser launches with proxy credentials for seamless anti-bot bypass
+
+### IMDb Infinite Scroll (Juliusz)
+- IMDb's search no longer uses `?start=` pagination - it uses JavaScript infinite scroll
+- Solution: Playwright clicks the "50 more" button repeatedly to load all results
+- Single page loads 1000+ movies before extracting links, avoiding redirect loops
+
+### URL Format Discovery (Lin)
+- Box Office Mojo uses IMDB's `tt` IDs but requires zero-padded 7-digit format
+- Movie ID `111161` must become `tt0111161` (not `tt111161`)
+- Format: `f"tt{movie_id:07d}"` ensures correct padding
+
+### Metacritic Slug Matching (Jeffrey)
+- Reads movies from IMDB database, converts titles to URL slugs
+- "The Dark Knight" → `the-dark-knight` → `metacritic.com/movie/the-dark-knight/`
+- Falls back to search if direct URL fails
+
+### Performance Optimizations
+- **Reviews limited to 4 per movie** (down from 100) - reduces requests by 96%
+- **Cast limited to 10 actors** (down from 15) - focuses on main cast
+- **Deduplication sets** prevent duplicate actors/directors in junction tables
+- **Non-Playwright for detail pages**: Only search pages need JS rendering
+
+### Pipeline & Settings Architecture (Juliusz)
+- **Dual export**: Every item saves to both CSV files and normalized SQLite database
+- **Stable ID generation**: Uses `zlib.adler32` hash for consistent foreign keys across runs
+- **Proxy configuration**: Bright Data Web Unlocker on port 33335 with US geo-targeting
+- **Playwright tuning**: 240s navigation timeout, resource blocking (images/fonts/stylesheets)
+- **AutoThrottle**: Dynamic delay adjustment (0.25s-5s) based on server response times
+- **Retry logic**: Auto-retry on 500/502/503/504/408/429 errors with 2 attempts
 
 ## Business Case
 
@@ -18,164 +54,67 @@ We position ourselves as a movie publishing company that needs to make strategic
 
 What is the relationship between critic reviews, audience reviews, and box office performance?
 
-This question helps the business decide how much to invest in critic marketing versus building audience buzz.
+## Data Sources
 
-## Data Requirements
-
-To answer our research question we need:
-
-| Data | Source | Purpose |
-|------|--------|---------|
-| Movie info | IMDb | Basic movie attributes like title, genre, director, runtime |
-| Metascores | Metacritic | Aggregated critic opinion |
-| User scores | IMDb or Metacritic | Aggregated audience opinion |
-| Review text | IMDb | Individual user reviews for sentiment analysis |
-| Box office | BoxOfficeMojo | Financial performance to measure success |
+| Data | Source | Spider |
+|------|--------|--------|
+| Movie info, cast, directors | IMDb | `movie_scraper` |
+| User reviews | IMDb | `movie_scraper` |
+| Metascores, critic reviews | Metacritic | `metacritic_scraper` |
+| Box office financials | Box Office Mojo | `boxoffice_scraper` |
 
 ## Database Schema
 
-Eight normalized tables store all scraped data.
+### Core Tables (IMDb)
+- `movie` - Basic movie info (id, title, year, score, genres)
+- `imdb_reviews` - User reviews with scores and text
+- `imdb_genres` / `imdb_movie_genres` - Normalized genres
+- `imdb_directors` / `imdb_movie_directors` - Directors with IMDB person IDs
+- `imdb_actors` / `imdb_movie_cast` - Cast with character names
 
-### Movie Table
+### Metacritic Tables
+- `metacritic_data` - Metascores, user scores, review counts
+- `metacritic_critic_reviews` / `metacritic_user_reviews` - Individual reviews
+- `metacritic_publications` / `metacritic_users` - Review sources
 
-| Column | Type | Description |
-|--------|------|-------------|
-| movie_id | INTEGER | Primary key (IMDb numeric ID) |
-| title | VARCHAR 255 | Movie title |
-| year | INTEGER | Release year |
-| user_score | DECIMAL 3,1 | IMDb rating |
-| box_office | BIGINT | Total gross revenue in USD |
-| genres | VARCHAR 200 | Comma separated genres |
-| scraped_at | DATETIME | Timestamp of scraping |
-
-### IMDb Review Table
-
-| Column | Type | Description |
-|--------|------|-------------|
-| review_id | INTEGER | Primary key |
-| movie_id | INTEGER | Foreign key to movie table |
-| author | VARCHAR 150 | Reviewer username |
-| score | VARCHAR 150 | Score given by reviewer |
-| text | TEXT | Full review text |
-| is_critic | BOOLEAN | True for critics, False for users |
-| review_date | DATE | When review was posted |
-| scraped_at | DATETIME | Timestamp of scraping |
-
-### Genre Table
-
-| Column | Type | Description |
-|--------|------|-------------|
-| genre_id | INTEGER | Primary key |
-| genre | VARCHAR 100 | Genre name (unique) |
-
-### Movie Genre Table (Junction)
-
-| Column | Type | Description |
-|--------|------|-------------|
-| movie_id | INTEGER | Foreign key to movie table |
-| genre_id | INTEGER | Foreign key to genre table |
-
-### Director Table
-
-| Column | Type | Description |
-|--------|------|-------------|
-| director_id | INTEGER | Primary key |
-| name | VARCHAR 255 | Director name |
-| imdb_person_id | VARCHAR 20 | IMDb person ID like nm0001104 |
-
-### Movie Director Table (Junction)
-
-| Column | Type | Description |
-|--------|------|-------------|
-| movie_id | INTEGER | Foreign key to movie table |
-| director_id | INTEGER | Foreign key to director table |
-| director_order | INTEGER | Order if multiple directors |
-
-### Actor Table
-
-| Column | Type | Description |
-|--------|------|-------------|
-| actor_id | INTEGER | Primary key |
-| name | VARCHAR 255 | Actor name |
-| imdb_person_id | VARCHAR 20 | IMDb person ID like nm0000151 |
-
-### Movie Cast Table (Junction)
-
-| Column | Type | Description |
-|--------|------|-------------|
-| movie_id | INTEGER | Foreign key to movie table |
-| actor_id | INTEGER | Foreign key to actor table |
-| character_name | VARCHAR 255 | Character played |
-| cast_order | INTEGER | Billing order |
-
-## Current Features
-
-Phase 2 completed:
-
-- Scrapes movie details from IMDb Top 250
-- Extracts directors with IMDb person IDs
-- Extracts top 15 cast members with character names
-- Scrapes user reviews (10 per movie by default)
-- Normalizes genres into separate table
-- Saves data to both CSV and SQLite database
-- Respects robots.txt and includes polite crawling delays
+### Box Office Table
+- `box_office_data` - Budget, domestic/international/worldwide gross
 
 ## Installation
 
 ```bash
 python -m venv venv
 source venv/bin/activate
-pip install scrapy
+pip install scrapy scrapy-playwright playwright
+playwright install chromium
 ```
-
-On Windows use venv\Scripts\activate instead.
 
 ## Usage
 
 ```bash
 cd imdb_scraper
-scrapy crawl movie_scraper
+
+# Step 1: Scrape movies from IMDb (required first)
+scrapy crawl movie_scraper -a max_movies=1000
+
+# Step 2: Scrape Metacritic data (reads from IMDb database)
+scrapy crawl metacritic_scraper
+
+# Step 3: Scrape Box Office data (reads from IMDb database)
+scrapy crawl boxoffice_scraper
 ```
 
-Output files will be created in the output directory:
+## Output
 
-- movies.csv (movie data only)
-- movies.db (all 8 tables)
+All data saved to `imdb_scraper/output/`:
+- `movies.db` - SQLite database with all tables
+- `*.csv` - Individual CSV files per table
 
 ## Configuration
 
-| Setting | Value |
-|---------|-------|
-| DOWNLOAD_DELAY | 2 seconds |
-| ROBOTSTXT_OBEY | True |
-| CONCURRENT_REQUESTS_PER_DOMAIN | 1 |
-| max_movies | 5 (change in spider) |
-| max_reviews_per_movie | 10 (change in spider) |
-
-To scrape more movies edit imdb_scraper/spiders/movie_scraper.py and change max_movies.
-
-## Project Structure
-
+Proxy credentials in `settings.py`:
+```python
+BRIGHTDATA_USER = "brd-customer-hl_xxxxx-zone-group4"
+BRIGHTDATA_PASS = "your_password"
+BRIGHTDATA_PORT = "33335"  # Web Unlocker
 ```
-imdb_scraper/
-    imdb_scraper/
-        items.py         # MovieItem and ReviewItem definitions
-        pipelines.py     # CSV and SQLite storage with 8 tables
-        settings.py      # Scrapy configuration
-        spiders/
-            movie_scraper.py  # Main spider
-    output/
-        movies.csv
-        movies.db
-    scrapy.cfg
-```
-
-## Project Phases
-
-| Phase | Status | Description |
-|-------|--------|-------------|
-| Phase 1 | Done | Basic IMDb scraper with CSV and SQLite output |
-| Phase 2 | Done | Review scraping, normalized schema with cast/directors |
-| Phase 3 | Todo | Integrate Bright Data proxy |
-| Phase 4 | Todo | Add Selenium for JavaScript pages |
-| Phase 5 | Todo | Add second data source like Metacritic or BoxOfficeMojo |

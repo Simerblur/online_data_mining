@@ -1,8 +1,13 @@
+# Author: Juliusz | Online Data Mining - Amsterdam UAS
+# IMDb Spider: Scrapes movies, cast, directors, and reviews using infinite scroll
+
+import asyncio
 import re
 from datetime import datetime
 
 import scrapy
 from imdb_scraper.items import MovieItem, ReviewItem
+from scrapy.selector import Selector
 
 
 class ImdbSpider(scrapy.Spider):
@@ -13,10 +18,11 @@ class ImdbSpider(scrapy.Spider):
 
     # scraping limits
     max_movies = 1000
-    max_reviews_per_movie = 100
+    max_reviews_per_movie = 4  # reduced from 100 for performance
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, max_movies=1000, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.max_movies = int(max_movies)
         self.movies_scraped = 0
         self.seen_movie_ids = set()
 
@@ -25,93 +31,138 @@ class ImdbSpider(scrapy.Spider):
         'USER_AGENT': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     }
 
-    def start_requests(self):
+    async def start(self):
         """Generate search URLs to get 1000+ movies sorted by number of votes."""
-        # IMDb search returns 50 results per page, we need 20 pages for 1000 movies
+        # IMDb search returns 50 results per page, uses infinite scroll / "See more" button
         # Using feature films sorted by number of votes (most popular first)
-        # Note: IMDb ignores the count parameter and always returns ~50 per page
-        base_url = "https://www.imdb.com/search/title/?title_type=feature&sort=num_votes,desc&start={}"
+        base_url = "https://www.imdb.com/search/title/?title_type=feature&sort=num_votes,desc"
 
-        # Generate 20 pages (50 movies each = 1000 total)
-        for start in range(1, 1001, 50):
-            yield scrapy.Request(
-                base_url.format(start),
-                callback=self.parse_search_results,
-                meta={
-                    'playwright': True,
-                    'playwright_include_page': False,
-                    'playwright_page_goto_kwargs': {
-                        'wait_until': 'domcontentloaded',
-                        'timeout': 120000,  # 2 minutes for proxy connections
-                    },
+        yield scrapy.Request(
+            base_url,
+            callback=self.parse_search_results,
+            meta={
+                'playwright': True,
+                'playwright_include_page': True,  # Need page object for infinite scroll
+                'playwright_page_goto_kwargs': {
+                    'wait_until': 'domcontentloaded',
+                    'timeout': 240000,
                 }
-            )
+            }
+        )
 
-    def parse_search_results(self, response):
-        """Parse IMDb search results page and follow movie links."""
-        # Log response for debugging
+    async def parse_search_results(self, response):
+        """Parse IMDb search results page using infinite scroll to load all movies."""
         self.logger.info(f"Parsing search results from: {response.url}")
         self.logger.info(f"Response status: {response.status}")
 
-        # Get movie links - try multiple selectors for different IMDb layouts
-        movie_links = []
+        page = response.meta.get('playwright_page')
+        if not page:
+            self.logger.error("No Playwright page object available!")
+            return
 
-        # Modern IMDb layout (2024+) - uses ipc-title-link-wrapper
-        movie_links = response.css('a.ipc-title-link-wrapper::attr(href)').getall()
-        self.logger.info(f"ipc-title-link-wrapper found: {len(movie_links)} links")
+        try:
+            # Calculate how many times we need to click "50 more" button
+            # Each click loads 50 more movies
+            clicks_needed = (self.max_movies // 50) + 1
+            self.logger.info(f"Will attempt up to {clicks_needed} clicks to load {self.max_movies} movies")
 
-        # Fallback: dli-title class (search results list item)
-        if not movie_links:
-            movie_links = response.css('div.dli-title a::attr(href)').getall()
-            self.logger.info(f"dli-title found: {len(movie_links)} links")
+            for click_num in range(clicks_needed):
+                if self.movies_scraped >= self.max_movies:
+                    self.logger.info(f"Reached max movies limit ({self.max_movies})")
+                    break
 
-        # Fallback: older lister layout
-        if not movie_links:
-            movie_links = response.css('h3.lister-item-header a::attr(href)').getall()
-            self.logger.info(f"lister-item-header found: {len(movie_links)} links")
+                # Scroll to bottom to trigger lazy loading and find the button
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await asyncio.sleep(1)
 
-        # Fallback: any link to /title/tt
-        if not movie_links:
-            movie_links = response.xpath('//a[contains(@href, "/title/tt")]/@href').getall()
-            # Deduplicate and filter
-            seen = set()
-            unique_links = []
+                # Try to find and click the "50 more" or "See more" button
+                # IMDb uses various button texts/selectors
+                button_selectors = [
+                    'button.ipc-see-more__button',
+                    'button:has-text("50 more")',
+                    'button:has-text("more")',
+                    'span.ipc-see-more__text',
+                    '[data-testid="adv-search-get-results"]',
+                ]
+
+                button_clicked = False
+                for selector in button_selectors:
+                    try:
+                        button = page.locator(selector).first
+                        if await button.is_visible(timeout=3000):
+                            self.logger.info(f"Found button with selector: {selector}, clicking...")
+                            await button.scroll_into_view_if_needed()
+                            await asyncio.sleep(0.5)
+                            await button.click()
+                            button_clicked = True
+                            self.logger.info(f"Click {click_num + 1}/{clicks_needed} completed")
+                            # Wait for new content to load
+                            await asyncio.sleep(2)
+                            break
+                    except Exception as e:
+                        continue
+
+                if not button_clicked:
+                    self.logger.info(f"No more 'load more' button found after {click_num} clicks")
+                    break
+
+            # Get final page content after all scrolling/clicking
+            content = await page.content()
+            selector = Selector(text=content)
+
+            # Extract movie links from the fully loaded page
+            movie_links = selector.css('a.ipc-title-link-wrapper::attr(href)').getall()
+            self.logger.info(f"Found {len(movie_links)} total movie links after infinite scroll")
+
+            # Fallback selectors if primary didn't work
+            if not movie_links:
+                movie_links = selector.xpath('//a[contains(@href, "/title/tt")]/@href').getall()
+                # Deduplicate
+                seen = set()
+                unique_links = []
+                for link in movie_links:
+                    match = re.search(r'(/title/tt\d+/)', link)
+                    if match and match.group(1) not in seen:
+                        seen.add(match.group(1))
+                        unique_links.append(link)
+                movie_links = unique_links
+                self.logger.info(f"Fallback xpath found: {len(movie_links)} links")
+
+            if not movie_links:
+                self.logger.warning(f"No movie links found on {response.url}")
+                # Save page for debugging
+                with open('debug_response.html', 'w', encoding='utf-8') as f:
+                    f.write(content)
+                self.logger.info("Saved response to debug_response.html")
+
+            # Process all found movie links
             for link in movie_links:
-                # Extract just the title ID part
-                match = re.search(r'(/title/tt\d+/)', link)
-                if match and match.group(1) not in seen:
-                    seen.add(match.group(1))
-                    unique_links.append(link)
-            movie_links = unique_links
-            self.logger.info(f"xpath fallback found: {len(movie_links)} links")
+                if self.movies_scraped >= self.max_movies:
+                    self.logger.info(f"Reached max movies: {self.movies_scraped}")
+                    break
 
-        if not movie_links:
-            self.logger.warning(f"No movie links found on {response.url}")
-            # Save page for debugging
-            with open('debug_response.html', 'w', encoding='utf-8') as f:
-                f.write(response.text)
-            self.logger.info("Saved response to debug_response.html")
+                # Extract movie ID to avoid duplicates
+                movie_id_match = re.search(r'/title/(tt\d+)/', link)
+                if movie_id_match:
+                    movie_id = movie_id_match.group(1)
+                    if movie_id in self.seen_movie_ids:
+                        continue
+                    self.seen_movie_ids.add(movie_id)
 
-        for link in movie_links:
-            if self.movies_scraped >= self.max_movies:
-                return
+                self.movies_scraped += 1
+                full_url = response.urljoin(link)
+                # Movie pages don't need Playwright - use regular request for speed
+                yield scrapy.Request(
+                    full_url,
+                    callback=self.parse_movie,
+                    meta={'playwright': False}
+                )
 
-            # Extract movie ID to avoid duplicates
-            movie_id_match = re.search(r'/title/(tt\d+)/', link)
-            if movie_id_match:
-                movie_id = movie_id_match.group(1)
-                if movie_id in self.seen_movie_ids:
-                    continue
-                self.seen_movie_ids.add(movie_id)
+            self.logger.info(f"Total movies queued for scraping: {self.movies_scraped}")
 
-            self.movies_scraped += 1
-            full_url = response.urljoin(link)
-            # Movie pages don't need Playwright - use regular request for speed
-            yield scrapy.Request(
-                full_url,
-                callback=self.parse_movie,
-                meta={'playwright': False}
-            )
+        finally:
+            # Always close the page to free resources
+            await page.close()
 
     def parse_movie(self, response):
         item = MovieItem()
@@ -249,12 +300,13 @@ class ImdbSpider(scrapy.Spider):
 
     def _extract_cast(self, response):
         cast = []
+        seen_ids = set()  # track seen actor IDs to avoid duplicates
 
         # get cast items
         cast_items = response.css('div[data-testid="title-cast-item"]')
 
-        # limit to top 15 actors
-        for order, item in enumerate(cast_items[:15], start=1):
+        # limit to top 10 actors (reduced from 15 for performance)
+        for order, item in enumerate(cast_items[:10], start=1):
             # get actor name and link
             actor_link = item.css('a[data-testid="title-cast-item__actor"]')
             actor_name = actor_link.css('::text').get()
@@ -263,6 +315,12 @@ class ImdbSpider(scrapy.Spider):
             # extract person id
             person_id_match = re.search(r'/name/(nm\d+)/', actor_href) if actor_href else None
             imdb_person_id = person_id_match.group(1) if person_id_match else None
+
+            # skip duplicates (same actor with multiple roles)
+            if imdb_person_id and imdb_person_id in seen_ids:
+                continue
+            if imdb_person_id:
+                seen_ids.add(imdb_person_id)
 
             # get character name
             character_name = item.css(

@@ -1,3 +1,4 @@
+# Author: Juliusz | Online Data Mining - Amsterdam UAS
 """Scrapy settings for IMDb scraper - optimized for 10k movies with Playwright + proxies."""
 
 from pathlib import Path
@@ -12,9 +13,9 @@ COOKIES_ENABLED = False
 FEED_EXPORT_ENCODING = "utf-8"
 
 # Concurrency and throttling (reduced for proxy stability)
-CONCURRENT_REQUESTS = 4
-CONCURRENT_REQUESTS_PER_DOMAIN = 4
-DOWNLOAD_DELAY = 1  # 1 second delay between requests
+CONCURRENT_REQUESTS = 2
+CONCURRENT_REQUESTS_PER_DOMAIN = 2
+DOWNLOAD_DELAY = 2  # 2 second delay between requests
 
 # AutoThrottle
 AUTOTHROTTLE_ENABLED = True
@@ -73,7 +74,7 @@ PLAYWRIGHT_LAUNCH_OPTIONS = {
     },
     "args": ["--disable-gpu", "--disable-dev-shm-usage", "--no-sandbox", "--disable-extensions"],
 }
-PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT = 120000  # 2 minutes for proxy connections
+PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT = 240000  # 4 minutes for proxy connections
 PLAYWRIGHT_CONTEXTS = {
     "default": {
         "ignore_https_errors": True,
@@ -85,5 +86,8 @@ PLAYWRIGHT_MAX_PAGES_PER_CONTEXT = 8
 PLAYWRIGHT_ABORT_REQUEST = lambda req: req.resource_type in ["image", "media", "font", "stylesheet"]
 
 # Logging
-LOG_FILE = str(Path.cwd() / "logs" / "scraper.log")
+# Always output to PROJECT_ROOT/logs
+# This assumes settings.py is in <root>/imdb_scraper/settings.py
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+LOG_FILE = str(PROJECT_ROOT / "logs" / "scraper.log")
 LOG_LEVEL = "INFO"

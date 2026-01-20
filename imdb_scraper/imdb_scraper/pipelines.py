@@ -1,4 +1,6 @@
-"""Pipelines for storing scraped movie data to CSV and SQLite (IMDb + Metacritic)."""
+# Author: Juliusz (IMDb pipelines), Jeffrey (Metacritic pipelines), Lin (Box Office pipelines)
+# Online Data Mining - Amsterdam UAS
+"""Pipelines for storing scraped movie data to CSV and SQLite (IMDb + Metacritic + Box Office)."""
 
 import csv
 import sqlite3
@@ -7,7 +9,7 @@ from pathlib import Path
 from itemadapter import ItemAdapter
 
 # IMDb items
-from imdb_scraper.items import MovieItem, ReviewItem
+from imdb_scraper.items import MovieItem, ReviewItem, BoxOfficeMojoItem
 
 # Metacritic (ERD) items
 from imdb_scraper.items import (
@@ -31,58 +33,96 @@ from imdb_scraper.items import (
 # ---------------------------------------------------------
 
 class CsvPipeline:
-    """Save IMDB movies to CSV file (and Metacritic movies to a separate CSV)."""
+    """Save items to separate CSV files (mirrors SQLite schema)."""
 
     def __init__(self):
-        self.file_imdb = None
-        self.writer_imdb = None
-
-        self.file_meta = None
-        self.writer_meta = None
+        # File handles and writers
+        self.files = {}
+        self.writers = {}
+        
+        # Deduplication sets (to mimic DB unique constraints within session)
+        self.seen_genres = set()
+        self.seen_directors = set()
+        self.seen_actors = set()
+        self.seen_persons = set()
+        self.seen_publications = set()
+        self.seen_prodcos = set()
+        self.seen_awards = set()
+        self.seen_users = set()
+        # Junction table deduplication (movie_id, person_id pairs)
+        self.seen_movie_directors = set()
+        self.seen_movie_actors = set()
+        self.seen_movie_genres = set()
+        
+        # Define schemas
+        self.schemas = {
+            "movie": ["movie_id", "title", "year", "user_score", "box_office", "genres", "scraped_at"],
+            "imdb_reviews": ["movie_id", "author", "score", "text", "is_critic", "review_date", "scraped_at"],
+            "imdb_genres": ["genre_id", "genre"],
+            "imdb_movie_genres": ["movie_id", "genre_id"],
+            "imdb_directors": ["director_id", "name", "imdb_person_id"],
+            "imdb_movie_directors": ["movie_id", "director_id", "director_order"],
+            "imdb_actors": ["actor_id", "name", "imdb_person_id"],
+            "imdb_movie_cast": ["movie_id", "actor_id", "character_name", "cast_order"],
+            "metacritic_data": ["movie_id", "metacritic_slug", "metascore", "metacritic_user_score", 
+                              "critic_review_count", "user_rating_count", "scraped_at"],
+            "metacritic_score_summary": ["movie_id", "critic_positive_count", "critic_mixed_count", 
+                                       "critic_negative_count", "user_positive_count", "user_mixed_count", 
+                                       "user_negative_count", "scraped_at"],
+            "metacritic_users": ["metacritic_user_id", "username", "profile_url", "scraped_at"],
+            "metacritic_user_reviews": ["user_review_id", "movie_id", "metacritic_user_id", "score", 
+                                      "review_date", "review_text", "helpful_count", "unhelpful_count", "scraped_at"],
+            "metacritic_publications": ["publication_id", "name", "publication_url"],
+            "metacritic_critic_reviews": ["critic_review_id", "movie_id", "publication_id", "critic_name", 
+                                        "score", "review_date", "excerpt", "full_review_url", "scraped_at"],
+            "metacritic_people": ["person_id", "name", "metacritic_person_url", "scraped_at"],
+            "metacritic_movie_person_roles": ["movie_person_role_id", "movie_id", "person_id", "role_type", 
+                                 "character_name", "billing_order", "scraped_at"],
+            "metacritic_production_companies": ["production_company_id", "name", "scraped_at"],
+            "metacritic_movie_production_companies": ["movie_id", "production_company_id", "scraped_at"],
+            "metacritic_award_orgs": ["award_org_id", "name", "award_org_url", "scraped_at"],
+            "metacritic_movie_award_summaries": ["movie_award_summary_id", "movie_id", "award_org_id", "wins",
+                                    "nominations", "scraped_at"],
+            "box_office_data": ["movie_id", "production_budget", "domestic_opening", "domestic_total",
+                               "international_total", "worldwide_total", "scraped_at"]
+        }
 
     def open_spider(self, spider):
-        output_dir = Path("output")
+        # Always output to PROJECT_ROOT/output
+        # This assumes pipelines.py is in <root>/imdb_scraper/pipelines.py
+        project_root = Path(__file__).resolve().parent.parent
+        output_dir = project_root / "output"
         output_dir.mkdir(exist_ok=True)
 
-        # IMDb movies CSV
-        imdb_path = output_dir / "movies_imdb.csv"
-        self.file_imdb = open(imdb_path, "a", newline="", encoding="utf-8")
-        imdb_fields = ["movie_id", "title", "year", "user_score", "box_office", "genres", "scraped_at"]
-        self.writer_imdb = csv.DictWriter(self.file_imdb, fieldnames=imdb_fields)
-
-        if not imdb_path.exists() or imdb_path.stat().st_size == 0:
-            self.writer_imdb.writeheader()
-
-        # Metacritic data CSV (extends movie table)
-        meta_path = output_dir / "metacritic_data.csv"
-        self.file_meta = open(meta_path, "a", newline="", encoding="utf-8")
-        meta_fields = [
-            "movie_id",  # FK to movie table
-            "metacritic_slug",
-            "metascore",
-            "metacritic_user_score",
-            "critic_review_count",
-            "user_rating_count",
-            "scraped_at",
-        ]
-        self.writer_meta = csv.DictWriter(self.file_meta, fieldnames=meta_fields)
-
-        if not meta_path.exists() or meta_path.stat().st_size == 0:
-            self.writer_meta.writeheader()
+        for name, fields in self.schemas.items():
+            path = output_dir / f"{name}.csv"
+            # Open in append mode
+            f = open(path, "a", newline="", encoding="utf-8")
+            writer = csv.DictWriter(f, fieldnames=fields)
+            
+            # Write header if new/empty
+            if not path.exists() or path.stat().st_size == 0:
+                writer.writeheader()
+                
+            self.files[name] = f
+            self.writers[name] = writer
 
     def close_spider(self, spider):
-        if self.file_imdb:
-            self.file_imdb.close()
-        if self.file_meta:
-            self.file_meta.close()
+        for f in self.files.values():
+            f.close()
 
     def process_item(self, item, spider):
         adapter = ItemAdapter(item)
 
-        # Write IMDb MovieItem
+        # -------------------------
+        # IMDb Items
+        # -------------------------
         if isinstance(item, MovieItem):
-            self.writer_imdb.writerow({
-                "movie_id": adapter.get("movie_id"),
+            movie_id = adapter.get("movie_id")
+            
+            # 1. movie
+            self.writers["movie"].writerow({
+                "movie_id": movie_id,
                 "title": adapter.get("title"),
                 "year": adapter.get("year"),
                 "user_score": adapter.get("user_score"),
@@ -90,20 +130,156 @@ class CsvPipeline:
                 "genres": adapter.get("genres"),
                 "scraped_at": adapter.get("scraped_at"),
             })
+            
+            # 2. genres & imdb_movie_genres
+            for genre in adapter.get("genres_list") or []:
+                genre_id = self._get_stable_id(f"genre:{genre.lower()}")
+                if genre_id not in self.seen_genres:
+                    self.seen_genres.add(genre_id)
+                    self.writers["imdb_genres"].writerow({
+                        "genre_id": genre_id,
+                        "genre": genre
+                    })
+                # Dedupe movie-genre junction
+                movie_genre_key = (movie_id, genre_id)
+                if movie_genre_key not in self.seen_movie_genres:
+                    self.seen_movie_genres.add(movie_genre_key)
+                    self.writers["imdb_movie_genres"].writerow({
+                        "movie_id": movie_id,
+                        "genre_id": genre_id
+                    })
+                
+            # 3. directors & imdb_movie_directors
+            for order, d in enumerate(adapter.get("directors") or [], 1):
+                name = d.get("name")
+                pid = d.get("imdb_person_id")
+                # Create ID if missing (unlikely for imdb)
+                if not pid:
+                     pid = f"gen:{self._get_stable_id(name)}"
 
-        # Write Metacritic data (linked to movie via movie_id FK)
-        if isinstance(item, MetacriticMovieItem):
-            self.writer_meta.writerow({
-                "movie_id": adapter.get("movie_id"),
-                "metacritic_slug": adapter.get("metacritic_slug"),
-                "metascore": adapter.get("metascore"),
-                "metacritic_user_score": adapter.get("user_score"),
-                "critic_review_count": adapter.get("critic_review_count"),
-                "user_rating_count": adapter.get("user_rating_count"),
-                "scraped_at": adapter.get("scraped_at"),
-            })
+                director_numeric_id = self._get_stable_id(pid)
+
+                # Check duplication by ID for directors table
+                if pid not in self.seen_directors:
+                    self.seen_directors.add(pid)
+                    self.writers["imdb_directors"].writerow({
+                        "director_id": director_numeric_id,
+                        "name": name,
+                        "imdb_person_id": pid
+                    })
+
+                # Dedupe movie-director junction
+                movie_director_key = (movie_id, director_numeric_id)
+                if movie_director_key not in self.seen_movie_directors:
+                    self.seen_movie_directors.add(movie_director_key)
+                    self.writers["imdb_movie_directors"].writerow({
+                        "movie_id": movie_id,
+                        "director_id": director_numeric_id,
+                        "director_order": order
+                    })
+                
+            # 4. cast & imdb_movie_cast
+            for c in adapter.get("cast") or []:
+                name = c.get("name")
+                pid = c.get("imdb_person_id")
+                character = c.get("character_name")
+                order = c.get("cast_order")
+
+                if not pid:
+                    pid = f"gen:{self._get_stable_id(name)}"
+
+                actor_numeric_id = self._get_stable_id(pid)
+
+                # Dedupe actors table
+                if pid not in self.seen_actors:
+                    self.seen_actors.add(pid)
+                    self.writers["imdb_actors"].writerow({
+                        "actor_id": actor_numeric_id,
+                        "name": name,
+                        "imdb_person_id": pid
+                    })
+
+                # Dedupe movie-actor junction
+                movie_actor_key = (movie_id, actor_numeric_id)
+                if movie_actor_key not in self.seen_movie_actors:
+                    self.seen_movie_actors.add(movie_actor_key)
+                    self.writers["imdb_movie_cast"].writerow({
+                        "movie_id": movie_id,
+                        "actor_id": actor_numeric_id,
+                        "character_name": character,
+                        "cast_order": order
+                    })
+
+        elif isinstance(item, ReviewItem):
+            self.writers["imdb_reviews"].writerow(adapter.asdict())
+
+        # -------------------------
+        # Metacritic Items
+        # -------------------------
+        elif isinstance(item, MetacriticMovieItem):
+            row = {k: adapter.get(k) for k in self.schemas["metacritic_data"] if k in item}
+            self.writers["metacritic_data"].writerow(row)
+
+        elif isinstance(item, MetacriticScoreSummaryItem):
+            self.writers["metacritic_score_summary"].writerow(adapter.asdict())
+
+        elif isinstance(item, MetacriticUserItem):
+            uid = adapter.get("metacritic_user_id")
+            if uid not in self.seen_users:
+                 self.seen_users.add(uid)
+                 self.writers["metacritic_users"].writerow(adapter.asdict())
+
+        elif isinstance(item, MetacriticUserReviewItem):
+             self.writers["metacritic_user_reviews"].writerow(adapter.asdict())
+
+        elif isinstance(item, MetacriticPublicationItem):
+            pid = adapter.get("publication_id")
+            if pid not in self.seen_publications:
+                self.seen_publications.add(pid)
+                self.writers["metacritic_publications"].writerow(adapter.asdict())
+
+        elif isinstance(item, MetacriticCriticReviewItem):
+             self.writers["metacritic_critic_reviews"].writerow(adapter.asdict())
+
+        elif isinstance(item, PersonItem):
+            pid = adapter.get("person_id")
+            if pid not in self.seen_persons:
+                self.seen_persons.add(pid)
+                self.writers["metacritic_people"].writerow(adapter.asdict())
+
+        elif isinstance(item, MoviePersonRoleItem):
+             self.writers["metacritic_movie_person_roles"].writerow(adapter.asdict())
+
+        elif isinstance(item, ProductionCompanyItem):
+             pid = adapter.get("production_company_id")
+             if pid not in self.seen_prodcos:
+                 self.seen_prodcos.add(pid)
+                 self.writers["metacritic_production_companies"].writerow(adapter.asdict())
+
+        elif isinstance(item, MovieProductionCompanyItem):
+             self.writers["metacritic_movie_production_companies"].writerow(adapter.asdict())
+
+        elif isinstance(item, AwardOrgItem):
+             aid = adapter.get("award_org_id")
+             if aid not in self.seen_awards:
+                 self.seen_awards.add(aid)
+                 self.writers["metacritic_award_orgs"].writerow(adapter.asdict())
+
+        elif isinstance(item, MovieAwardSummaryItem):
+             self.writers["metacritic_movie_award_summaries"].writerow(adapter.asdict())
+
+        # -------------------------
+        # Box Office Mojo Items
+        # -------------------------
+        elif isinstance(item, BoxOfficeMojoItem):
+            self.writers["box_office_data"].writerow(adapter.asdict())
 
         return item
+
+    def _get_stable_id(self, key):
+        """Generate stable numeric ID from string key (similar to hash)."""
+        import zlib
+        return zlib.adler32(str(key).encode('utf-8')) & 0xffffffff
 
 
 # ---------------------------------------------------------
@@ -118,7 +294,9 @@ class SqlitePipeline:
         self.cur = None
 
     def open_spider(self, spider):
-        output_dir = Path("output")
+        # Always output to PROJECT_ROOT/output
+        project_root = Path(__file__).resolve().parent.parent
+        output_dir = project_root / "output"
         output_dir.mkdir(exist_ok=True)
 
         self.conn = sqlite3.connect(output_dir / "movies.db")
@@ -318,6 +496,20 @@ class SqlitePipeline:
                 nominations INTEGER,
                 scraped_at DATETIME NOT NULL
             );
+
+            -- =========================================================
+            -- BOX OFFICE MOJO DATA (extends movie table, FK to movie.movie_id)
+            -- =========================================================
+
+            CREATE TABLE IF NOT EXISTS box_office_data (
+                movie_id INTEGER PRIMARY KEY REFERENCES movie(movie_id),
+                production_budget BIGINT,
+                domestic_opening BIGINT,
+                domestic_total BIGINT,
+                international_total BIGINT,
+                worldwide_total BIGINT,
+                scraped_at DATETIME NOT NULL
+            );
         """)
 
         self.conn.commit()
@@ -360,6 +552,10 @@ class SqlitePipeline:
             self._save_award_org(adapter)
         elif isinstance(item, MovieAwardSummaryItem):
             self._save_movie_award_summary(adapter)
+
+        # Box Office Mojo
+        elif isinstance(item, BoxOfficeMojoItem):
+            self._save_box_office_data(adapter)
 
         return item
 
@@ -650,6 +846,29 @@ class SqlitePipeline:
             adapter.get("award_org_id"),
             adapter.get("wins"),
             adapter.get("nominations"),
+            adapter.get("scraped_at"),
+        ))
+        self.conn.commit()
+
+    # -------------------------
+    # Box Office Mojo save method
+    # -------------------------
+
+    def _save_box_office_data(self, adapter):
+        """Save Box Office Mojo financial data."""
+        self.cur.execute("""
+            INSERT OR REPLACE INTO box_office_data (
+                movie_id, production_budget, domestic_opening,
+                domestic_total, international_total, worldwide_total, scraped_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            adapter.get("movie_id"),
+            adapter.get("production_budget"),
+            adapter.get("domestic_opening"),
+            adapter.get("domestic_total"),
+            adapter.get("international_total"),
+            adapter.get("worldwide_total"),
             adapter.get("scraped_at"),
         ))
         self.conn.commit()
