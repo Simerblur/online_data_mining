@@ -234,8 +234,8 @@ class MetacriticSpider(scrapy.Spider):
         # Release date from JSON-LD or page text.
         release_date = self._extract_release_date(page_text, ld_movie)
 
-        # Runtime minutes from JSON-LD or patterns like "1 h 36 m".
-        runtime_minutes = self._extract_runtime_minutes(page_text, ld_movie)
+        # Runtime minutes (Updated Logic).
+        runtime_minutes = self._extract_runtime_minutes(response, page_text, ld_movie)
 
         # Content rating from JSON-LD or page text.
         content_rating = self._extract_content_rating(page_text, ld_movie)
@@ -247,8 +247,8 @@ class MetacriticSpider(scrapy.Spider):
         if not summary:
             summary = self._safe_strip(" ".join(response.css('div[class*="description"] *::text').getall() or []))
 
-        # Metascore as 0-100.
-        metascore = self._extract_metascore(page_text)
+        # Metascore as 0-100 (Updated Logic).
+        metascore = self._extract_metascore(response, page_text)
 
         # User score as 0.0-10.0.
         user_score = self._extract_userscore(page_text)
@@ -427,10 +427,8 @@ class MetacriticSpider(scrapy.Spider):
     # -------------------------
 
     def _browse_meta(self) -> Dict[str, Any]:
-        # If browse Playwright disabled, return empty.
         if not self.use_playwright_on_browse:
             return {}
-        # Otherwise enable Playwright for browse.
         return {
             "playwright": True,
             "playwright_include_page": False,
@@ -438,10 +436,8 @@ class MetacriticSpider(scrapy.Spider):
         }
 
     def _detail_meta(self) -> Dict[str, Any]:
-        # If detail Playwright disabled, return empty.
         if not self.use_playwright_on_detail:
             return {}
-        # Otherwise enable Playwright for detail pages.
         return {
             "playwright": True,
             "playwright_include_page": False,
@@ -453,24 +449,16 @@ class MetacriticSpider(scrapy.Spider):
     # -------------------------
 
     def _yield_people_roles(self, response, movie_id: int):
-        # Directors can be found on the page as plain text.
         directors = self._split_list(self._detail_value(response, "Directed By"))
-
-        # Writers can be found on the page as plain text.
         writers = self._split_list(self._detail_value(response, "Written By"))
-
-        # Actors appear in "Top Cast" with "Name Character".
         actors = self._extract_top_cast_pairs(response)
 
-        # Yield directors.
         for name in directors:
             yield from self._yield_person_role(movie_id, name, "director", None, None)
 
-        # Yield writers.
         for name in writers:
             yield from self._yield_person_role(movie_id, name, "writer", None, None)
 
-        # Yield actors with billing order.
         for idx, (actor_name, character_name) in enumerate(actors[:15], start=1):
             yield from self._yield_person_role(movie_id, actor_name, "actor", character_name, idx)
 
@@ -482,17 +470,12 @@ class MetacriticSpider(scrapy.Spider):
         character_name: Optional[str],
         billing_order: Optional[int],
     ):
-        # Normalize person name.
         key = (person_name or "").strip().lower()
-
-        # Skip empty.
         if not key:
             return
 
-        # Create stable person_id.
         person_id = self._stable_id(f"person:{key}")
 
-        # Yield person only once.
         if key not in self.seen_persons:
             self.seen_persons.add(key)
             yield PersonItem(
@@ -502,7 +485,6 @@ class MetacriticSpider(scrapy.Spider):
                 scraped_at=datetime.now().isoformat(),
             )
 
-        # Yield role link row.
         yield MoviePersonRoleItem(
             movie_person_role_id=self._stable_id(f"mpr:{movie_id}:{person_id}:{role_type}:{billing_order or 0}"),
             movie_id=movie_id,
@@ -514,11 +496,6 @@ class MetacriticSpider(scrapy.Spider):
         )
 
     def _yield_production_companies(self, page_text: str, movie_id: int):
-        # Metacritic often shows the distributor or production label in a bullet list.
-        # Example token: "Blue Harbor Entertainment"
-        # We keep this best-effort, because the site is not always consistent.
-
-        # Try a pattern that matches a likely company name near the year/runtime list.
         candidates = re.findall(r"\b([A-Z][A-Za-z0-9&.' -]{2,60} Entertainment)\b", page_text)
         companies = []
         for c in candidates:
@@ -526,19 +503,13 @@ class MetacriticSpider(scrapy.Spider):
             if c and c not in companies:
                 companies.append(c)
 
-        # If we found nothing, do not yield anything.
         if not companies:
             return
 
-        # Loop companies.
         for name in companies[:5]:
-            # Normalize.
             key = name.strip().lower()
-
-            # Create stable ID.
             prodco_id = self._stable_id(f"prodco:{key}")
 
-            # Yield company only once.
             if key not in self.seen_prodcos:
                 self.seen_prodcos.add(key)
                 yield ProductionCompanyItem(
@@ -547,7 +518,6 @@ class MetacriticSpider(scrapy.Spider):
                     scraped_at=datetime.now().isoformat(),
                 )
 
-            # Yield link table row.
             yield MovieProductionCompanyItem(
                 movie_id=movie_id,
                 production_company_id=prodco_id,
@@ -555,29 +525,20 @@ class MetacriticSpider(scrapy.Spider):
             )
 
     def _yield_awards(self, page_text: str, movie_id: int):
-        # Best-effort pattern like: "Oscars: 2 wins, 5 nominations"
         matches = re.findall(
             r"([A-Za-z0-9 '&-]{3,60}):\s*(\d+)\s*wins?,\s*(\d+)\s*nominations?",
             page_text,
             flags=re.IGNORECASE,
         )
 
-        # Loop matches.
         for (org_name, wins, noms) in matches:
-            # Clean org name.
             org_clean = (org_name or "").strip()
-
-            # Normalize key.
             key = org_clean.lower()
-
-            # Skip empty.
             if not key:
                 continue
 
-            # Create award org id.
             award_org_id = self._stable_id(f"award:{key}")
 
-            # Yield award org only once.
             if key not in self.seen_awards:
                 self.seen_awards.add(key)
                 yield AwardOrgItem(
@@ -587,7 +548,6 @@ class MetacriticSpider(scrapy.Spider):
                     scraped_at=datetime.now().isoformat(),
                 )
 
-            # Yield movie award summary.
             yield MovieAwardSummaryItem(
                 movie_award_summary_id=self._stable_id(f"ma:{movie_id}:{award_org_id}"),
                 movie_id=movie_id,
@@ -602,97 +562,68 @@ class MetacriticSpider(scrapy.Spider):
     # -------------------------
 
     def _extract_slug(self, url_or_path: str) -> Optional[str]:
-        # Match /movie/<slug> and also allow a trailing slash and query params.
         m = re.search(r"/movie/([^/]+)/?(?:\?.*)?$", url_or_path or "")
         return m.group(1) if m else None
 
     def _stable_id(self, text: str) -> int:
-        # Use adler32 checksum for stable numeric id.
         checksum = zlib.adler32(text.encode("utf-8"))
-        # Add offset to keep id positive and large.
         return int(10_000_000_000 + checksum)
 
     def _safe_strip(self, s: Any) -> Optional[str]:
-        # None check.
         if s is None:
             return None
-        # Convert to string.
         s = str(s)
-        # Strip whitespace.
         s = s.strip()
-        # Return None if empty.
         return s if s else None
 
     def _split_list(self, text: Optional[str]) -> List[str]:
-        # Return empty list if no text.
         if not text:
             return []
-        # Split on comma.
         parts = [p.strip() for p in text.split(",")]
-        # Keep only non-empty.
         return [p for p in parts if p]
 
     def _page_text(self, response) -> str:
-        # Get all visible text nodes.
         parts = response.css("body *::text").getall() or []
-        # Strip each part and keep non-empty.
         parts = [p.strip() for p in parts if p and p.strip()]
-        # Join into one string.
         text = " ".join(parts)
-        # Normalize whitespace.
         text = re.sub(r"\s+", " ", text).strip()
         return text
 
     def _tokens(self, response) -> List[str]:
-        # Get all text nodes as tokens.
         parts = response.css("body *::text").getall() or []
-        # Clean tokens.
         tokens = []
         for p in parts:
             p = (p or "").strip()
             if not p:
                 continue
-            # Normalize internal whitespace.
             p = re.sub(r"\s+", " ", p).strip()
             if p:
                 tokens.append(p)
         return tokens
 
     def _extract_jsonld_movie(self, response) -> Optional[Dict[str, Any]]:
-        # Read JSON-LD scripts.
         scripts = response.xpath('//script[@type="application/ld+json"]/text()').getall() or []
-        # Loop scripts.
         for raw in scripts:
-            # Clean.
             raw = (raw or "").strip()
-            # Skip empty.
             if not raw:
                 continue
-            # Try parse JSON.
             try:
                 data = json.loads(raw)
             except Exception:
                 continue
-            # JSON can be dict or list.
             candidates = data if isinstance(data, list) else [data]
-            # Loop candidates.
             for obj in candidates:
-                # Only dict is useful.
                 if not isinstance(obj, dict):
                     continue
-                # Graph case.
                 if "@graph" in obj and isinstance(obj["@graph"], list):
                     for g in obj["@graph"]:
                         if isinstance(g, dict) and g.get("@type") in ("Movie", "Film"):
                             return g
-                # Direct case.
                 if obj.get("@type") in ("Movie", "Film"):
                     return obj
-        # Return None if not found.
         return None
 
     def _detail_value(self, response, label: str) -> Optional[str]:
-        # Best-effort: find a node that contains the label and return its text.
         xp = f'//*[self::li or self::div or self::span][.//text()[contains(., "{label}")]]'
         node_html = response.xpath(xp).get()
         if not node_html:
@@ -707,76 +638,106 @@ class MetacriticSpider(scrapy.Spider):
     # -------------------------
 
     def _extract_release_date(self, text: str, ld_movie: Optional[Dict[str, Any]]) -> Optional[str]:
-        # 1) JSON-LD datePublished.
         if ld_movie:
             dp = ld_movie.get("datePublished")
             if isinstance(dp, str) and dp.strip():
                 return dp.strip()
 
-        # 2) Look for "Release Date Apr 4, 2025".
         m = re.search(r"\bRelease Date\s+([A-Z][a-z]{2}\s+\d{1,2},\s+\d{4})\b", text)
         if m:
             return m.group(1).strip()
 
         return None
 
-    def _extract_runtime_minutes(self, text: str, ld_movie: Optional[Dict[str, Any]]) -> Optional[int]:
-        # 1) JSON-LD duration like "PT96M".
+    def _extract_runtime_minutes(self, response, text: str, ld_movie: Optional[Dict[str, Any]]) -> Optional[int]:
+        """
+        Calculates minutes based on "1 h 36 m" format.
+        Formula: hours * 60 + minutes.
+        """
+        # 1. Try JSON-LD first (cleanest)
         if ld_movie:
             dur = ld_movie.get("duration")
             if isinstance(dur, str):
-                m = re.search(r"PT(\d+)M", dur)
+                m = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?", dur)
                 if m:
-                    return int(m.group(1))
+                    h = int(m.group(1)) if m.group(1) else 0
+                    mn = int(m.group(2)) if m.group(2) else 0
+                    total = h * 60 + mn
+                    if total > 0:
+                        return total
 
-        # 2) Pattern like "1 h 36 m" anywhere.
-        m = re.search(r"\b(\d+)\s*h\s*(\d+)\s*m\b", text, flags=re.IGNORECASE)
-        if m:
-            return int(m.group(1)) * 60 + int(m.group(2))
+        # 2. Try Regex on the specific text format from the site: "1 h 36 m"
+        # Using the page text or specifically looking into span tags is safer than class names that might change.
+        
+        # Pattern for "1 h 36 m"
+        m_full = re.search(r'(\d+)\s*h\s*(\d+)\s*m', text)
+        if m_full:
+            hours = int(m_full.group(1))
+            minutes = int(m_full.group(2))
+            return hours * 60 + minutes
 
-        # 3) Pattern like "96 m" anywhere.
-        m = re.search(r"\b(\d+)\s*m\b", text, flags=re.IGNORECASE)
-        if m:
-            val = int(m.group(1))
-            # Avoid catching years.
+        # Pattern for just "2 h" (exact hour count)
+        m_hours = re.search(r'(\d+)\s*h(?![\w\s]*m)', text)
+        if m_hours:
+            return int(m_hours.group(1)) * 60
+
+        # Pattern for just "96 min" or "96 m"
+        m_mins = re.search(r'(\d+)\s*(?:min|m)\b', text)
+        if m_mins:
+            val = int(m_mins.group(1))
+            # Sanity check: reasonable movie length (10 to 400 mins)
             if 10 <= val <= 400:
                 return val
 
         return None
 
     def _extract_content_rating(self, text: str, ld_movie: Optional[Dict[str, Any]]) -> Optional[str]:
-        # 1) JSON-LD contentRating.
         if ld_movie:
             cr = ld_movie.get("contentRating")
             if isinstance(cr, str) and cr.strip():
                 return cr.strip()
 
-        # 2) Pattern like "Rating PG-13".
         m = re.search(r"\bRating\s+(G|PG|PG-13|R|NC-17|NR|Not Rated|TV-MA|TV-14|TV-PG)\b", text)
         if m:
             return m.group(1).strip()
 
         return None
 
-    def _extract_metascore(self, text: str) -> Optional[int]:
-        # Look for "Metascore ... 85".
-        m = re.search(r"\bMetascore\b.*?\b(\d{1,3})\b", text, flags=re.IGNORECASE)
-        if not m:
-            return None
-        val = int(m.group(1))
-        if 0 <= val <= 100:
-            return val
+    def _extract_metascore(self, response, text: str) -> Optional[int]:
+        """
+        Fixed logic to extract the actual Metascore, not the review count.
+        """
+        # 1. Try CSS Selector (Best for accuracy)
+        # Look for the score box specifically
+        score_box = response.css('.c-productScoreInfo_scoreNumber span::text').get()
+        if score_box and score_box.strip().isdigit():
+            return int(score_box.strip())
+
+        # 2. JSON-LD Fallback
+        # Sometimes hidden in aggregateRating
+        # (Already parsed in _extract_jsonld_movie, but usually Metacritic JSON uses 1-10 scale for agg rating)
+        
+        # 3. Text Regex Fallback (Improved)
+        # Look for "Metascore" followed by a number, but ensure it's not followed by "reviews"
+        # Matches "Metascore 85"
+        m = re.search(r"\bMetascore\b\s*(\d{1,3})(?!\s*reviews)", text, flags=re.IGNORECASE)
+        if m:
+            val = int(m.group(1))
+            if 0 <= val <= 100:
+                return val
+        
+        # If that fails, look for the big score number pattern if "Metascore" text is split
+        # This is risky, so we rely on the CSS selector mostly.
+        
         return None
 
     def _extract_userscore(self, text: str) -> Optional[float]:
-        # Look for "User Score ... 6.8".
         m = re.search(r"\bUser Score\b.*?\b(\d{1,2}\.\d)\b", text, flags=re.IGNORECASE)
         if m:
             val = float(m.group(1))
             if 0.0 <= val <= 10.0:
                 return val
 
-        # Fallback integer like "User Score ... 7".
         m = re.search(r"\bUser Score\b.*?\b(\d{1,2})\b", text, flags=re.IGNORECASE)
         if m:
             val = float(m.group(1))
@@ -786,22 +747,18 @@ class MetacriticSpider(scrapy.Spider):
         return None
 
     def _extract_based_on_count(self, text: str, kind: str) -> Optional[int]:
-        # Critic: "Based on 7 Critic Reviews"
         if kind == "critic":
             m = re.search(r"\bBased on\s+([\d,]+)\s+Critic Reviews\b", text, flags=re.IGNORECASE)
             if not m:
                 return None
             return int(m.group(1).replace(",", ""))
 
-        # User: "Based on 28 User Ratings"
         m = re.search(r"\bBased on\s+([\d,]+)\s+User Ratings\b", text, flags=re.IGNORECASE)
         if not m:
             return None
         return int(m.group(1).replace(",", ""))
 
     def _extract_distribution_counts(self, text: str, kind: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
-        # Critic block example:
-        # "86% Positive 6 Reviews 14% Mixed 1 Review 0% Negative 0 Reviews"
         if kind == "critic":
             m = re.search(
                 r"\bPositive\b\s+(\d+)\s+Reviews?\b.*?\bMixed\b\s+(\d+)\s+Reviews?\b.*?\bNegative\b\s+(\d+)\s+Reviews?\b",
@@ -812,8 +769,6 @@ class MetacriticSpider(scrapy.Spider):
                 return None, None, None
             return int(m.group(1)), int(m.group(2)), int(m.group(3))
 
-        # User block example:
-        # "68% Positive 19 Ratings 14% Mixed 4 Ratings 18% Negative 5 Ratings"
         m = re.search(
             r"\bPositive\b\s+(\d+)\s+Ratings?\b.*?\bMixed\b\s+(\d+)\s+Ratings?\b.*?\bNegative\b\s+(\d+)\s+Ratings?\b",
             text,
@@ -828,12 +783,9 @@ class MetacriticSpider(scrapy.Spider):
     # -------------------------
 
     def _extract_top_cast_pairs(self, response) -> List[Tuple[str, Optional[str]]]:
-        # Find /person/ links, because they usually contain actor + character.
         raw = response.css('a[href*="/person/"]::text').getall() or []
         raw = [re.sub(r"\s+", " ", (x or "").strip()) for x in raw if (x or "").strip()]
 
-        # Heuristic: many entries look like "Karan Soni Naveen Gavaskar"
-        # So we split the string and assume last 1-3 words is character if it looks like a role.
         pairs = []
         seen = set()
 
@@ -843,22 +795,17 @@ class MetacriticSpider(scrapy.Spider):
                 continue
             seen.add(key)
 
-            # Skip headings that are not names.
             if t.lower() in ("view all", "view all cast & crew"):
                 continue
 
-            # If it is a single token, assume only name.
             parts = t.split(" ")
             if len(parts) <= 2:
                 pairs.append((t, None))
                 continue
 
-            # Otherwise, take first 2 words as name candidate, rest as character candidate.
-            # This is best-effort because names vary.
             actor_name = " ".join(parts[:2]).strip()
             character_name = " ".join(parts[2:]).strip()
 
-            # If character looks too short, ignore it.
             if len(character_name) < 2:
                 character_name = None
 
@@ -871,8 +818,6 @@ class MetacriticSpider(scrapy.Spider):
     # -------------------------
 
     def _parse_critic_reviews_from_tokens(self, tokens: List[str]) -> List[Dict[str, Any]]:
-        # Critic entries usually look like:
-        # Date, Score, Publication, Excerpt, Read More, By Name, FULL REVIEW ...
         date_re = re.compile(r"^[A-Z][a-z]{2}\s+\d{1,2},\s+\d{4}$")
         score_re = re.compile(r"^\d{1,3}$")
 
@@ -880,7 +825,6 @@ class MetacriticSpider(scrapy.Spider):
         i = 0
 
         while i < len(tokens):
-            # Look for a date token.
             if not date_re.match(tokens[i]):
                 i += 1
                 continue
@@ -888,7 +832,6 @@ class MetacriticSpider(scrapy.Spider):
             review_date = tokens[i]
             i += 1
 
-            # Next find a score within the next few tokens.
             score = None
             score_pos = None
             for j in range(i, min(i + 6, len(tokens))):
@@ -902,7 +845,6 @@ class MetacriticSpider(scrapy.Spider):
             if score is None or score_pos is None:
                 continue
 
-            # Publication is usually the next non-numeric token after score.
             pub_name = None
             for j in range(score_pos + 1, min(score_pos + 6, len(tokens))):
                 if not score_re.match(tokens[j]) and not date_re.match(tokens[j]):
@@ -910,7 +852,6 @@ class MetacriticSpider(scrapy.Spider):
                         pub_name = tokens[j]
                         break
 
-            # Excerpt is usually after publication, until "Read More".
             excerpt_parts = []
             j = (score_pos + 2) if pub_name else (score_pos + 1)
 
@@ -928,7 +869,6 @@ class MetacriticSpider(scrapy.Spider):
             if not excerpt:
                 excerpt = None
 
-            # Critic name often appears as "By Name".
             critic_name = None
             look = " ".join(tokens[max(0, j - 5): min(len(tokens), j + 5)])
             m = re.search(r"\bBy\s+([A-Z][A-Za-z .,'-]{2,80})\b", look)
@@ -947,14 +887,11 @@ class MetacriticSpider(scrapy.Spider):
                 }
             )
 
-            # Continue scanning from where we stopped.
             i = j + 1
 
         return out
 
     def _parse_user_reviews_from_tokens(self, tokens: List[str]) -> List[Dict[str, Any]]:
-        # User entries usually look like:
-        # Date, Score(0-10), Username, Review text..., Read More, Report
         date_re = re.compile(r"^[A-Z][a-z]{2}\s+\d{1,2},\s+\d{4}$")
         score_re = re.compile(r"^\d{1,2}$")
 
@@ -962,7 +899,6 @@ class MetacriticSpider(scrapy.Spider):
         i = 0
 
         while i < len(tokens):
-            # Find a date.
             if not date_re.match(tokens[i]):
                 i += 1
                 continue
@@ -970,7 +906,6 @@ class MetacriticSpider(scrapy.Spider):
             review_date = tokens[i]
             i += 1
 
-            # Score is usually next.
             if i >= len(tokens) or not score_re.match(tokens[i]):
                 continue
 
@@ -981,11 +916,9 @@ class MetacriticSpider(scrapy.Spider):
             score = val
             i += 1
 
-            # Next token is often username.
             username = tokens[i] if i < len(tokens) else None
             i += 1
 
-            # Review text until "Read More" or "Report" or next date.
             review_parts = []
             while i < len(tokens):
                 low = tokens[i].lower()
