@@ -1,6 +1,6 @@
 # Author: Juliusz (IMDb pipelines), Jeffrey (Metacritic pipelines), Lin (Box Office pipelines)
 # Online Data Mining - Amsterdam UAS
-"""Pipelines for storing scraped movie data to CSV and SQLite (IMDb + Metacritic + Box Office)."""
+# Pipelines for storing scraped movie data to CSV and SQLite (IMDb + Metacritic + Box Office).
 
 import csv
 import sqlite3
@@ -19,19 +19,15 @@ from imdb_scraper.items import (
 )
 
 
-# ---------------------------------------------------------
-# CSV PIPELINE (optional, still useful for quick debug)
-# ---------------------------------------------------------
-
 class CsvPipeline:
-    """Save items to separate CSV files (mirrors SQLite schema)."""
+    # Save items to separate CSV files
 
     def __init__(self):
         # File handles and writers
         self.files = {}
         self.writers = {}
 
-        # Deduplication sets (to mimic DB unique constraints within session)
+        # Deduplication sets 
         self.seen_genres = set()
         self.seen_directors = set()
         self.seen_actors = set()
@@ -43,7 +39,8 @@ class CsvPipeline:
         # Define schemas
         self.schemas = {
             # IMDb tables
-            "movie": ["movie_id", "title", "year", "user_score", "box_office", "genres", "scraped_at"],
+            "movie": ["movie_id", "title", "year", "user_score", "box_office", "genres", 
+                      "release_date", "runtime_minutes", "mpaa_rating", "scraped_at"], # Added new columns
             "imdb_reviews": ["movie_id", "author", "score", "text", "is_critic", "review_date", "scraped_at"],
             "imdb_genres": ["genre_id", "genre"],
             "imdb_movie_genres": ["movie_id", "genre_id"],
@@ -51,6 +48,13 @@ class CsvPipeline:
             "imdb_movie_directors": ["movie_id", "director_id", "director_order"],
             "imdb_actors": ["actor_id", "name", "imdb_person_id"],
             "imdb_movie_cast": ["movie_id", "actor_id", "character_name", "cast_order"],
+            "production_companies": ["company_id", "name"],
+            "movie_companies": ["movie_id", "company_id"],
+            "imdb_writers": ["writer_id", "name", "imdb_person_id"],
+            "imdb_movie_writers": ["movie_id", "writer_id"],
+            "imdb_composers": ["composer_id", "name", "imdb_person_id"],
+            "imdb_movie_composers": ["movie_id", "composer_id"],
+
             # Metacritic tables (simplified - only reviews)
             "metacritic_data": ["movie_id", "metacritic_slug", "metascore", "metacritic_user_score",
                               "critic_review_count", "user_rating_count", "scraped_at"],
@@ -90,9 +94,7 @@ class CsvPipeline:
     def process_item(self, item, spider):
         adapter = ItemAdapter(item)
 
-        # -------------------------
         # IMDb Items
-        # -------------------------
         if isinstance(item, MovieItem):
             movie_id = adapter.get("movie_id")
             
@@ -105,7 +107,11 @@ class CsvPipeline:
                 "box_office": adapter.get("box_office"),
                 "genres": adapter.get("genres"),
                 "scraped_at": adapter.get("scraped_at"),
+                "release_date": adapter.get("release_date"),
+                "runtime_minutes": adapter.get("runtime_minutes"),
+                "mpaa_rating": adapter.get("mpaa_rating"),
             })
+            self.files["movie"].flush()
             
             # 2. genres & imdb_movie_genres
             for genre in adapter.get("genres_list") or []:
@@ -189,9 +195,7 @@ class CsvPipeline:
         elif isinstance(item, ReviewItem):
             self.writers["imdb_reviews"].writerow(adapter.asdict())
 
-        # -------------------------
         # Metacritic Items (simplified)
-        # -------------------------
         elif isinstance(item, MetacriticMovieItem):
             self.writers["metacritic_data"].writerow({
                 "movie_id": adapter.get("movie_id"),
@@ -209,26 +213,20 @@ class CsvPipeline:
         elif isinstance(item, MetacriticUserReviewItem):
             self.writers["metacritic_user_reviews"].writerow(adapter.asdict())
 
-        # -------------------------
         # Box Office Mojo Items
-        # -------------------------
         elif isinstance(item, BoxOfficeMojoItem):
             self.writers["box_office_data"].writerow(adapter.asdict())
 
         return item
 
     def _get_stable_id(self, key):
-        """Generate stable numeric ID from string key (similar to hash)."""
+        # Generate stable numeric ID from string key (similar to hash).
         import zlib
         return zlib.adler32(str(key).encode('utf-8')) & 0xffffffff
 
 
-# ---------------------------------------------------------
-# SQLITE PIPELINE (normalized DB)
-# ---------------------------------------------------------
-
 class SqlitePipeline:
-    """Save data to SQLite with normalized tables (IMDb + Metacritic ERD tables)."""
+    # Save data to SQLite with normalized tables (IMDb + Metacritic ERD tables).
 
     def __init__(self):
         self.conn = None
@@ -254,15 +252,9 @@ class SqlitePipeline:
             self.conn.commit()
             self.conn.close()
 
-    # -------------------------
-    # Create all tables
-    # -------------------------
-
     def _create_tables(self):
         self.cur.executescript("""
-            -- =========================================================
             -- IMDb TABLES
-            -- =========================================================
 
             CREATE TABLE IF NOT EXISTS movie (
                 movie_id INTEGER PRIMARY KEY,
@@ -323,9 +315,7 @@ class SqlitePipeline:
                 PRIMARY KEY (movie_id, actor_id)
             );
 
-            -- =========================================================
             -- METACRITIC TABLES (simplified - only reviews)
-            -- =========================================================
 
             CREATE TABLE IF NOT EXISTS metacritic_data (
                 movie_id INTEGER PRIMARY KEY REFERENCES movie(movie_id),
@@ -358,9 +348,7 @@ class SqlitePipeline:
                 scraped_at DATETIME NOT NULL
             );
 
-            -- =========================================================
             -- BOX OFFICE MOJO TABLE
-            -- =========================================================
 
             CREATE TABLE IF NOT EXISTS box_office_data (
                 movie_id INTEGER PRIMARY KEY REFERENCES movie(movie_id),
@@ -375,18 +363,20 @@ class SqlitePipeline:
 
         self.conn.commit()
 
-    # -------------------------
-    # Process item router
-    # -------------------------
-
     def process_item(self, item, spider):
         adapter = ItemAdapter(item)
 
         # IMDb
         if isinstance(item, MovieItem):
-            self._save_imdb_movie(adapter)
+            try:
+                self._save_imdb_movie(adapter)
+            except Exception as e:
+                spider.logger.error(f"Error in SqlitePipeline._save_imdb_movie: {e}")
         elif isinstance(item, ReviewItem):
-            self._save_imdb_review(adapter)
+            try:
+                self._save_imdb_review(adapter)
+            except Exception as e:
+                spider.logger.error(f"Error in SqlitePipeline._save_imdb_review: {e}")
 
         # Metacritic (simplified)
         elif isinstance(item, MetacriticMovieItem):
@@ -401,10 +391,6 @@ class SqlitePipeline:
             self._save_box_office_data(adapter)
 
         return item
-
-    # -------------------------
-    # IMDb save methods (existing)
-    # -------------------------
 
     def _save_imdb_movie(self, adapter):
         movie_id = adapter.get("movie_id")
@@ -489,12 +475,8 @@ class SqlitePipeline:
         # Fallback: return lastrowid (rare case)
         return self.cur.lastrowid
 
-    # -------------------------
-    # Metacritic save methods (simplified)
-    # -------------------------
-
     def _save_metacritic_movie(self, adapter):
-        """Save Metacritic data to metacritic_data table."""
+        # Save Metacritic data to metacritic_data table.
         self.cur.execute("""
             INSERT OR REPLACE INTO metacritic_data (
                 movie_id, metacritic_slug, metascore, metacritic_user_score,
@@ -513,7 +495,7 @@ class SqlitePipeline:
         self.conn.commit()
 
     def _save_metacritic_critic_review(self, adapter):
-        """Save Metacritic critic review."""
+        # Save Metacritic critic review.
         self.cur.execute("""
             INSERT OR REPLACE INTO metacritic_critic_review (
                 critic_review_id, movie_id, publication_name, critic_name,
@@ -533,7 +515,7 @@ class SqlitePipeline:
         self.conn.commit()
 
     def _save_metacritic_user_review(self, adapter):
-        """Save Metacritic user review."""
+        # Save Metacritic user review.
         self.cur.execute("""
             INSERT OR REPLACE INTO metacritic_user_review (
                 user_review_id, movie_id, username, score,
@@ -551,12 +533,8 @@ class SqlitePipeline:
         ))
         self.conn.commit()
 
-    # -------------------------
-    # Box Office Mojo save method
-    # -------------------------
-
     def _save_box_office_data(self, adapter):
-        """Save Box Office Mojo financial data."""
+        # Save Box Office Mojo financial data.
         self.cur.execute("""
             INSERT OR REPLACE INTO box_office_data (
                 movie_id, production_budget, domestic_opening,

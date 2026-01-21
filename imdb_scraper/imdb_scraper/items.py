@@ -3,86 +3,86 @@
 
 import scrapy
 
-
-# =============================================================================
-# IMDb Items
-# =============================================================================
-
 class MovieItem(scrapy.Item):
-    """Movie data from IMDB."""
-    movie_id = scrapy.Field()      # imdb numeric id
-    title = scrapy.Field()         # movie title
-    year = scrapy.Field()          # release year
-    user_score = scrapy.Field()    # imdb rating
-    box_office = scrapy.Field()    # gross revenue
-    genres = scrapy.Field()        # comma separated genres
-    genres_list = scrapy.Field()   # list for normalization
-    directors = scrapy.Field()     # list of director dicts
-    cast = scrapy.Field()          # list of actor dicts
-    scraped_at = scrapy.Field()    # scrape timestamp
+    # Data model for an IMDb Movie.
+    # Maps to the 'movie' table in the database.
+    movie_id = scrapy.Field()      # IMDb numeric ID (e.g., 12345 from tt0012345)
+    title = scrapy.Field()         # Movie Title
+    year = scrapy.Field()          # Release Year
+    user_score = scrapy.Field()    # IMDb User Rating (0.0 - 10.0)
+    box_office = scrapy.Field()    # Worldwide Gross Revenue (integer)
+    genres = scrapy.Field()        # Comma-separated genres string
+    genres_list = scrapy.Field()   # List of genres for normalization
+    directors = scrapy.Field()     # List of dictionaries: {'name': str, 'imdb_person_id': str}
+    cast = scrapy.Field()          # List of dictionaries: {'name': str, 'imdb_person_id': str, 'role': str}
+    
+    # New Metadata Fields
+    release_date = scrapy.Field()          # Full release date string (e.g. "March 24, 1972")
+    runtime_minutes = scrapy.Field()       # Duration in minutes (int)
+    mpaa_rating = scrapy.Field()           # MPAA rating (e.g. "R", "PG-13")
+    production_companies = scrapy.Field()  # List of company names (strings)
+    composers = scrapy.Field()             # List of dictionaries: {'name': str, 'imdb_person_id': str}
+    writers = scrapy.Field()               # List of dictionaries: {'name': str, 'imdb_person_id': str}
+    
+    scraped_at = scrapy.Field()    # Timestamp of scraping
 
 
 class ReviewItem(scrapy.Item):
-    """User review from IMDB."""
-    movie_id = scrapy.Field()      # foreign key to movie
-    author = scrapy.Field()        # reviewer username
-    score = scrapy.Field()         # rating given
-    text = scrapy.Field()          # review content
-    is_critic = scrapy.Field()     # critic or user
-    review_date = scrapy.Field()   # date posted
-    scraped_at = scrapy.Field()    # scrape timestamp
+    # Data model for an IMDb User Review.
+    # Maps to the 'imdb_review' table.
+    movie_id = scrapy.Field()      # FK to MovieItem
+    author = scrapy.Field()        # Reviewer Username
+    score = scrapy.Field()         # Rating Score given by user
+    text = scrapy.Field()          # Full text of the review
+    is_critic = scrapy.Field()     # Boolean (always False for user reviews)
+    review_date = scrapy.Field()   # Date string
+    scraped_at = scrapy.Field()    # Timestamp
 
-
-# =============================================================================
-# Metacritic Items (simplified - only reviews)
-# =============================================================================
 
 class MetacriticMovieItem(scrapy.Item):
-    """Basic Metacritic movie info with scores (FK to movie table)."""
-    movie_id = scrapy.Field()              # FK to movie table
-    metacritic_url = scrapy.Field()        # url to movie page
-    metacritic_slug = scrapy.Field()       # slug in url
-    title_on_site = scrapy.Field()         # title as shown on Metacritic
-    metascore = scrapy.Field()             # 0-100 critic metascore
-    user_score = scrapy.Field()            # 0-10 user score
-    critic_review_count = scrapy.Field()   # number of critic reviews
-    user_rating_count = scrapy.Field()     # number of user ratings
-    scraped_at = scrapy.Field()            # timestamp
+    # Data model for Metacritic movie metadata.
+    # Contains aggregate scores and counts.
+    movie_id = scrapy.Field()              # FK: Aligns with IMDb Movie ID
+    metacritic_url = scrapy.Field()        # URL to Metacritic page
+    metacritic_slug = scrapy.Field()       # Slug (e.g., 'the-godfather')
+    title_on_site = scrapy.Field()         # Title as it appears on Metacritic
+    metascore = scrapy.Field()             # Critic Score (0-100)
+    user_score = scrapy.Field()            # User Score (0-10)
+    critic_review_count = scrapy.Field()   # Count of critic reviews
+    user_rating_count = scrapy.Field()     # Count of user ratings
+    scraped_at = scrapy.Field()            # Timestamp
 
 
 class MetacriticCriticReviewItem(scrapy.Item):
-    """Critic review from Metacritic."""
-    critic_review_id = scrapy.Field()      # PK
-    movie_id = scrapy.Field()              # FK to movie
-    publication_name = scrapy.Field()      # publication name (denormalized)
-    critic_name = scrapy.Field()           # critic name (if available)
-    score = scrapy.Field()                 # 0-100 score
-    review_date = scrapy.Field()           # date
-    excerpt = scrapy.Field()               # excerpt text
-    scraped_at = scrapy.Field()            # timestamp
+    # Data model for a professional Critic Review on Metacritic.
+    critic_review_id = scrapy.Field()      # Unique ID (if available, else hash)
+    movie_id = scrapy.Field()              # FK to MovieItem
+    publication_name = scrapy.Field()      # Publisher (e.g., "The New York Times")
+    critic_name = scrapy.Field()           # Critic Name
+    score = scrapy.Field()                 # Score given by critic (0-100)
+    review_date = scrapy.Field()           # Date string
+    excerpt = scrapy.Field()               # Short snippet of the review
+    scraped_at = scrapy.Field()            # Timestamp
 
 
 class MetacriticUserReviewItem(scrapy.Item):
-    """User review from Metacritic."""
-    user_review_id = scrapy.Field()        # PK
-    movie_id = scrapy.Field()              # FK to movie
-    username = scrapy.Field()              # username (denormalized)
-    score = scrapy.Field()                 # 0-10 score
-    review_date = scrapy.Field()           # date
-    review_text = scrapy.Field()           # long text
-    scraped_at = scrapy.Field()            # timestamp
+    # Data model for a User Review on Metacritic.
+    user_review_id = scrapy.Field()        # Unique ID
+    movie_id = scrapy.Field()              # FK to MovieItem
+    username = scrapy.Field()              # User's handle
+    score = scrapy.Field()                 # User Score (0-10)
+    review_date = scrapy.Field()           # Date string
+    review_text = scrapy.Field()           # Full review text
+    scraped_at = scrapy.Field()            # Timestamp
 
-
-# =============================================================================
-# Box Office Mojo Items
-# =============================================================================
 
 class BoxOfficeMojoItem(scrapy.Item):
-    """Box Office financial data (FK to movie table)."""
-    movie_id = scrapy.Field()              # FK to movie (IMDB tt id as int)
-    production_budget = scrapy.Field()     # production budget in dollars
-    domestic_opening = scrapy.Field()      # domestic opening weekend
-    domestic_total = scrapy.Field()        # domestic total gross
-    international_total = scrapy.Field()   # international total gross
-    worldwide_total = scrapy.Field()       # worldwide total gross
-    scraped_at = scrapy.Field()            # timestamp
+    # Financial data from Box Office Mojo.
+    # Provides detailed budget and revenue breakdown.
+    movie_id = scrapy.Field()              # FK to MovieItem
+    production_budget = scrapy.Field()     # Production Budget (USD)
+    domestic_opening = scrapy.Field()      # Domestic Opening Weekend Revenue
+    domestic_total = scrapy.Field()        # Total Domestic Revenue
+    international_total = scrapy.Field()   # Total International Revenue
+    worldwide_total = scrapy.Field()       # Total Worldwide Revenue
+    scraped_at = scrapy.Field()            # Timestamp

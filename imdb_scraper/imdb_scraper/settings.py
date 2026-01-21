@@ -1,5 +1,5 @@
 # Author: Juliusz | Online Data Mining - Amsterdam UAS
-"""Scrapy settings for IMDb scraper - optimized for 10k movies with Playwright + proxies."""
+# Scrapy settings for IMDb scraper 
 
 from pathlib import Path
 
