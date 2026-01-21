@@ -135,11 +135,15 @@ class BoxOfficeMojoSpider(scrapy.Spider):
         item['international_total'] = international
         item['worldwide_total'] = worldwide
 
+        # Extract domestic distributor
+        item['domestic_distributor'] = self._extract_domestic_distributor(response, page_text)
+
         self.logger.info(
             f"  Budget: {item['production_budget']}, "
             f"Domestic: {item['domestic_total']}, "
             f"International: {item['international_total']}, "
-            f"Worldwide: {item['worldwide_total']}"
+            f"Worldwide: {item['worldwide_total']}, "
+            f"Distributor: {item['domestic_distributor']}"
         )
 
         yield item
@@ -269,6 +273,23 @@ class BoxOfficeMojoSpider(scrapy.Spider):
                         break
 
         return domestic, international, worldwide
+
+    def _extract_domestic_distributor(self, response, page_text):
+        """Extract domestic distributor name."""
+        # Method 1: Look for "Domestic Distributor" or "Distributor" in spans
+        distributor = response.xpath(
+            '//span[contains(text(), "Distributor")]/following-sibling::span/text()'
+        ).get()
+        if distributor:
+            return distributor.strip()
+
+        # Method 2: Regex search for "Domestic Distributor" pattern
+        # "Domestic Distributor Warner Bros."
+        match = re.search(r'Domestic Distributor\s+([A-Za-z0-9 .,&]+?)(?:\s+See full command|(?=\s+See full)|$)', page_text, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+            
+        return None
 
     def handle_error(self, failure):
         """Handle request errors (404, timeout, etc.)."""

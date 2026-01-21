@@ -146,7 +146,7 @@ class ImdbSpider(scrapy.Spider):
 
             # Queue extraction for each movie found
             for link in movie_links:
-                if self.movies_scraped >= self.max_movies:
+                if self.max_movies > 0 and self.movies_scraped >= self.max_movies:
                     self.logger.info(f"Reached max movies: {self.movies_scraped}")
                     break
 
@@ -177,7 +177,7 @@ class ImdbSpider(scrapy.Spider):
 
             # Pagination Logic
             # IMDb lists 50 movies per page. We manually calculate the next 'start' index.
-            if self.movies_scraped < self.max_movies:
+            if self.max_movies == 0 or self.movies_scraped < self.max_movies:
                 # Find current start index from URL (default to 1)
                 current_start_match = re.search(r'start=(\d+)', response.url)
                 current_start = int(current_start_match.group(1)) if current_start_match else 1

@@ -85,4 +85,5 @@ class BoxOfficeMojoItem(scrapy.Item):
     domestic_total = scrapy.Field()        # Total Domestic Revenue
     international_total = scrapy.Field()   # Total International Revenue
     worldwide_total = scrapy.Field()       # Total Worldwide Revenue
+    domestic_distributor = scrapy.Field()  # Domestic Distributor (e.g. "Warner Bros.")
     scraped_at = scrapy.Field()            # Timestamp

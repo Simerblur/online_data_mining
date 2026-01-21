@@ -64,7 +64,7 @@ class CsvPipeline:
                                       "review_date", "review_text", "scraped_at"],
             # Box Office Mojo table
             "box_office_data": ["movie_id", "production_budget", "domestic_opening", "domestic_total",
-                               "international_total", "worldwide_total", "scraped_at"]
+                               "international_total", "worldwide_total", "domestic_distributor", "scraped_at"]
         }
 
     def open_spider(self, spider):
@@ -241,8 +241,9 @@ class SqlitePipeline:
         self.conn = sqlite3.connect(output_dir / "movies.db")
         self.cur = self.conn.cursor()
 
-        # Enable foreign keys
+        # Enable foreign keys and WAL mode for concurrency
         self.cur.execute("PRAGMA foreign_keys = ON")
+        self.cur.execute("PRAGMA journal_mode = WAL")
 
         # Create tables
         self._create_tables()
@@ -357,6 +358,7 @@ class SqlitePipeline:
                 domestic_total BIGINT,
                 international_total BIGINT,
                 worldwide_total BIGINT,
+                domestic_distributor VARCHAR(255),
                 scraped_at DATETIME NOT NULL
             );
         """)
@@ -538,9 +540,9 @@ class SqlitePipeline:
         self.cur.execute("""
             INSERT OR REPLACE INTO box_office_data (
                 movie_id, production_budget, domestic_opening,
-                domestic_total, international_total, worldwide_total, scraped_at
+                domestic_total, international_total, worldwide_total, domestic_distributor, scraped_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             adapter.get("movie_id"),
             adapter.get("production_budget"),
@@ -548,6 +550,7 @@ class SqlitePipeline:
             adapter.get("domestic_total"),
             adapter.get("international_total"),
             adapter.get("worldwide_total"),
+            adapter.get("domestic_distributor"),
             adapter.get("scraped_at"),
         ))
         self.conn.commit()
