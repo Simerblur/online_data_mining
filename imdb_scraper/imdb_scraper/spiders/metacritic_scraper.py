@@ -1,139 +1,68 @@
+# Author: Jeffrey | Online Data Mining - Amsterdam UAS
 """
-Metacritic Scraper (compact, almost-ERD complete).
-I wrote this in a simple style so I can explain it during the defense.
+Metacritic Scraper - Simplified version that only scrapes reviews.
 
-This spider yields ERD items:
-- metacritic_movie
-- metacritic_score_summary
-- metacritic_user + metacritic_user_review
-- metacritic_publication + metacritic_critic_review
-- person + movie_person_role
-- production_company + movie_production_company
-- award_org + movie_award_summary (best-effort)
+This spider yields:
+- MetacriticMovieItem (basic movie info + metascore)
+- MetacriticCriticReviewItem (critic reviews)
+- MetacriticUserReviewItem (user reviews)
 
-Updated: Now reads movies from IMDB SQLite database and searches Metacritic
-to match them, using IMDB movie_id as foreign key.
-
-Author: Jeffrey | Online Data Mining - Amsterdam UAS.
+Reads movies from IMDB SQLite database and matches them on Metacritic.
 """
 
-# json is used to parse JSON-LD if Metacritic provides it.
-import json
-
-# re is used for regex patterns like slug, numbers, and dates.
 import re
-
-# sqlite3 is used to read IMDB movies from the database.
 import sqlite3
-
-# zlib is used to create stable numeric IDs from text keys.
 import zlib
-
-# datetime is used for scraped_at timestamps.
 from datetime import datetime
-
-# pathlib is used for file paths.
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-# typing is only used to make the code easier to read.
-from typing import Any, Dict, List, Optional, Tuple
-
-# urllib is used to encode search queries.
-from urllib.parse import quote
-
-# Scrapy is our crawler framework.
 import scrapy
-
-# Selector is used to turn small HTML fragments into text.
 from scrapy import Selector
 
-# Import ERD-aligned items from items.py.
 from imdb_scraper.items import (
     MetacriticMovieItem,
-    MetacriticScoreSummaryItem,
-    MetacriticUserItem,
-    MetacriticUserReviewItem,
-    MetacriticPublicationItem,
     MetacriticCriticReviewItem,
-    PersonItem,
-    MoviePersonRoleItem,
-    AwardOrgItem,
-    MovieAwardSummaryItem,
-    ProductionCompanyItem,
-    MovieProductionCompanyItem,
+    MetacriticUserReviewItem,
 )
 
 
 class MetacriticSpider(scrapy.Spider):
-    # Name for running: scrapy crawl metacritic_scraper
     name = "metacritic_scraper"
-
-    # Safety: only allow this domain.
     allowed_domains = ["metacritic.com"]
 
-    # Use a normal browser User-Agent to reduce blocking.
     custom_settings = {
         "USER_AGENT": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         ),
-        "DEFAULT_REQUEST_HEADERS": {
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-        },
+        "DOWNLOAD_DELAY": 2,
+        "CONCURRENT_REQUESTS": 2,
     }
 
     def __init__(
         self,
-        # Limit movies for testing, example: -a max_movies=10
         max_movies: int = 1000,
-        # Browse pages limit (Metacritic browse is paginated), example: -a max_pages=2
-        max_pages: int = 3,
-        # Review pages per movie (critic + user), example: -a max_review_pages=2
-        max_review_pages: int = 2,
-        # Reviews per page to keep, example: -a max_reviews_per_movie=25
-        max_reviews_per_movie: int = 100,
-        # Seed urls for quick testing (comma-separated).
-        seed_urls: str = "",
-        # Use Playwright on browse pages (browse sometimes needs JS).
-        use_playwright_on_browse: str = "true",
-        # Use Playwright on detail pages if blocked.
-        use_playwright_on_detail: str = "false",
-        # NEW: Use IMDB movies from database instead of browsing Metacritic.
-        use_imdb_source: str = "true",
-        # NEW: Path to IMDB SQLite database.
+        max_review_pages: int = 1,
+        max_reviews_per_movie: int = 10,
         imdb_db_path: str = "",
         *args,
         **kwargs,
     ):
-        # Call the parent constructor.
         super().__init__(*args, **kwargs)
-
-        # Convert numeric args (Scrapy passes them as strings).
         self.max_movies = int(max_movies)
-        self.max_pages = int(max_pages)
         self.max_review_pages = int(max_review_pages)
         self.max_reviews_per_movie = int(max_reviews_per_movie)
+        self.movies_scraped = 0
+        self.seen_slugs = set()
 
-        # Parse seed urls list.
-        self.seed_urls = [u.strip() for u in (seed_urls or "").split(",") if u.strip()]
-
-        # Parse playwright flags.
-        self.use_playwright_on_browse = str(use_playwright_on_browse).lower() == "true"
-        self.use_playwright_on_detail = str(use_playwright_on_detail).lower() == "true"
-
-        # NEW: Parse IMDB source flag.
-        self.use_imdb_source = str(use_imdb_source).lower() == "true"
-
-        # NEW: Set IMDB database path (auto-detect if not provided).
+        # Find IMDB database
         if imdb_db_path:
             self.imdb_db_path = Path(imdb_db_path)
         else:
-            # Auto-detect: look in common locations.
             possible_paths = [
+                Path(__file__).parent.parent.parent / "output" / "movies.db",
                 Path("output/movies.db"),
-                Path("../output/movies.db"),
-                Path.cwd() / "output" / "movies.db",
             ]
             self.imdb_db_path = None
             for p in possible_paths:
@@ -141,925 +70,188 @@ class MetacriticSpider(scrapy.Spider):
                     self.imdb_db_path = p
                     break
 
-        # Track number of scraped movies.
-        self.movies_scraped = 0
-
-        # Dedupe sets.
-        self.seen_slugs = set()
-        self.seen_users = set()
-        self.seen_publications = set()
-        self.seen_persons = set()
-        self.seen_prodcos = set()
-        self.seen_awards = set()
-
-    # -------------------------
-    # Start requests
-    # -------------------------
-
     def start_requests(self):
-        # If seed urls are provided, we scrape only those.
-        if self.seed_urls:
-            # Loop seed URLs but limit by max_movies.
-            for url in self.seed_urls[: self.max_movies]:
-                # Request the movie page.
-                yield scrapy.Request(
-                    url=url,
-                    callback=self.parse_movie,
-                    meta=self._detail_meta(),
-                    priority=50,
-                )
-            # Stop here to avoid browsing.
+        """Read movies from IMDB database and request Metacritic pages."""
+        if not self.imdb_db_path or not self.imdb_db_path.exists():
+            self.logger.error("IMDB database not found. Run movie_scraper first.")
             return
 
-        # NEW: If use_imdb_source is enabled, read movies from IMDB database.
-        if self.use_imdb_source and self.imdb_db_path and self.imdb_db_path.exists():
-            self.logger.info(f"Reading IMDB movies from: {self.imdb_db_path}")
-            yield from self._start_requests_from_imdb()
-            return
+        self.logger.info(f"Reading movies from: {self.imdb_db_path}")
 
-        # Otherwise scrape from browse pages.
-        base_url = "https://www.metacritic.com/browse/movie/?page={}"
-
-        # Loop pages from 0 to max_pages-1.
-        for page in range(0, self.max_pages):
-            # Build URL for this browse page.
-            url = base_url.format(page)
-
-            # Request browse page.
-            yield scrapy.Request(
-                url=url,
-                callback=self.parse_browse,
-                meta=self._browse_meta(),
-                priority=10,
-            )
-
-    def _start_requests_from_imdb(self):
-        """Read movies from IMDB SQLite database and go directly to Metacritic movie pages."""
         conn = sqlite3.connect(self.imdb_db_path)
         cursor = conn.cursor()
-
-        # Get movies from IMDB database.
         cursor.execute("""
-            SELECT movie_id, title, year
-            FROM movie
-            ORDER BY movie_id
-            LIMIT ?
+            SELECT movie_id, title, year FROM movie ORDER BY movie_id LIMIT ?
         """, (self.max_movies,))
-
         movies = cursor.fetchall()
         conn.close()
 
-        self.logger.info(f"Found {len(movies)} IMDB movies to fetch from Metacritic")
+        self.logger.info(f"Found {len(movies)} movies to fetch from Metacritic")
 
         for imdb_movie_id, title, year in movies:
-            # Skip if already processed.
-            if imdb_movie_id in self.seen_slugs:
-                continue
-
-            # Convert title to Metacritic slug format.
-            # "The Dark Knight" -> "the-dark-knight"
             slug = self._title_to_slug(title)
-
-            if not slug:
-                self.logger.warning(f"Could not create slug for: {title}")
+            if not slug or slug in self.seen_slugs:
                 continue
-
-            # Mark as seen to avoid duplicates.
             self.seen_slugs.add(slug)
 
-            # Go directly to the movie page (no search needed).
             movie_url = f"https://www.metacritic.com/movie/{slug}/"
-
-            self.logger.info(f"Fetching Metacritic: {title} ({year}) -> {slug}")
-
             yield scrapy.Request(
                 url=movie_url,
                 callback=self.parse_movie,
-                meta={
-                    **self._detail_meta(),
-                    "imdb_movie_id": imdb_movie_id,
-                    "imdb_title": title,
-                    "imdb_year": year,
-                },
-                priority=20,
-                # Don't fail on 404 - movie might not exist on Metacritic.
-                errback=self._handle_movie_error,
+                meta={"imdb_movie_id": imdb_movie_id, "title": title, "year": year},
+                errback=self._handle_error,
             )
 
     def _title_to_slug(self, title: str) -> Optional[str]:
-        """Convert movie title to Metacritic URL slug format."""
+        """Convert movie title to Metacritic URL slug."""
         if not title:
             return None
-
-        # Convert to lowercase.
         slug = title.lower()
-
-        # Remove common prefixes/suffixes that Metacritic might strip.
-        # e.g., "The Godfather" -> "godfather" on some sites, but Metacritic keeps "the".
-
-        # Replace special characters with spaces.
         slug = re.sub(r'[^\w\s-]', ' ', slug)
-
-        # Replace multiple spaces with single space.
         slug = re.sub(r'\s+', ' ', slug).strip()
-
-        # Replace spaces with hyphens.
         slug = slug.replace(' ', '-')
-
-        # Remove multiple consecutive hyphens.
-        slug = re.sub(r'-+', '-', slug)
-
-        # Remove leading/trailing hyphens.
-        slug = slug.strip('-')
-
+        slug = re.sub(r'-+', '-', slug).strip('-')
         return slug if slug else None
 
-    def _handle_movie_error(self, failure):
-        """Handle errors when fetching movie pages (e.g., 404 not found)."""
-        request = failure.request
-        imdb_title = request.meta.get("imdb_title", "Unknown")
-        imdb_year = request.meta.get("imdb_year", "")
-        self.logger.warning(f"Failed to fetch Metacritic page for: {imdb_title} ({imdb_year}) - {failure.value}")
-
-    def parse_search_results(self, response):
-        """Parse Metacritic search results and find best match for IMDB movie."""
-        imdb_movie_id = response.meta.get("imdb_movie_id")
-        imdb_title = response.meta.get("imdb_title", "")
-        imdb_year = response.meta.get("imdb_year")
-
-        self.logger.info(f"Searching Metacritic for: {imdb_title} ({imdb_year}) [IMDB: {imdb_movie_id}]")
-
-        # Find movie links in search results.
-        # Metacritic search returns links like /movie/the-dark-knight/
-        movie_links = response.css('a[href^="/movie/"]::attr(href)').getall() or []
-
-        # Also try to extract from JSON in page (Metacritic uses JSON data).
-        page_text = response.text
-
-        # Look for movie slugs in the page.
-        slug_matches = re.findall(r'/movie/([a-z0-9-]+)/?', page_text)
-
-        # Combine and dedupe.
-        all_slugs = []
-        for href in movie_links:
-            slug = self._extract_slug(href)
-            if slug and slug not in all_slugs:
-                all_slugs.append(slug)
-
-        for slug in slug_matches:
-            if slug not in all_slugs and slug not in ("critic-reviews", "user-reviews"):
-                all_slugs.append(slug)
-
-        if not all_slugs:
-            self.logger.warning(f"No Metacritic results found for: {imdb_title} ({imdb_year})")
-            return
-
-        # Try to find best match by comparing slugs to title.
-        best_slug = self._find_best_matching_slug(all_slugs, imdb_title, imdb_year)
-
-        if not best_slug:
-            # Fall back to first result.
-            best_slug = all_slugs[0]
-            self.logger.info(f"Using first result for {imdb_title}: {best_slug}")
-        else:
-            self.logger.info(f"Best match for {imdb_title}: {best_slug}")
-
-        # Skip if already scraped.
-        if best_slug in self.seen_slugs:
-            self.logger.info(f"Already scraped: {best_slug}")
-            return
-
-        self.seen_slugs.add(best_slug)
-        self.movies_scraped += 1
-
-        # Request the movie page.
-        movie_url = f"https://www.metacritic.com/movie/{best_slug}/"
-        yield scrapy.Request(
-            url=movie_url,
-            callback=self.parse_movie,
-            meta={
-                **self._detail_meta(),
-                "imdb_movie_id": imdb_movie_id,
-                "imdb_title": imdb_title,
-                "imdb_year": imdb_year,
-            },
-            priority=30,
-        )
-
-    def _find_best_matching_slug(self, slugs: List[str], title: str, year: Optional[int]) -> Optional[str]:
-        """Find the best matching Metacritic slug for an IMDB title."""
-        if not slugs:
-            return None
-
-        # Normalize title for comparison.
-        title_lower = (title or "").lower()
-        title_words = set(re.findall(r'\w+', title_lower))
-
-        best_score = -1
-        best_slug = None
-
-        for slug in slugs:
-            # Convert slug to words.
-            slug_words = set(slug.replace("-", " ").split())
-
-            # Calculate overlap score.
-            overlap = len(title_words & slug_words)
-            score = overlap
-
-            # Bonus if year is in slug.
-            if year and str(year) in slug:
-                score += 3
-
-            # Bonus for exact title match.
-            slug_as_title = slug.replace("-", " ")
-            if slug_as_title == title_lower:
-                score += 10
-
-            if score > best_score:
-                best_score = score
-                best_slug = slug
-
-        # Only return if we have reasonable confidence.
-        if best_score >= 2:
-            return best_slug
-
-        return None
-
-    # -------------------------
-    # Browse parsing
-    # -------------------------
-
-    def parse_browse(self, response):
-        # Stop if we hit our movie limit.
-        if self.movies_scraped >= self.max_movies:
-            return
-
-        # Collect links that look like /movie/<slug>
-        hrefs = response.css('a[href^="/movie/"]::attr(href)').getall() or []
-
-        # Loop all hrefs.
-        for href in hrefs:
-            # Stop if we hit limit.
-            if self.movies_scraped >= self.max_movies:
-                break
-
-            # Skip empty.
-            if not href:
-                continue
-
-            # Keep only direct movie pages, not review pages.
-            if not re.match(r"^/movie/[^/]+/?$", href):
-                continue
-
-            # Extract slug.
-            slug = self._extract_slug(href)
-
-            # Skip if slug missing.
-            if not slug:
-                continue
-
-            # Skip if we already scraped it.
-            if slug in self.seen_slugs:
-                continue
-
-            # Mark slug as seen.
-            self.seen_slugs.add(slug)
-
-            # Increase movie counter.
-            self.movies_scraped += 1
-
-            # Follow the movie link.
-            yield response.follow(
-                href,
-                callback=self.parse_movie,
-                meta=self._detail_meta(),
-                priority=30,
-            )
-
-    # -------------------------
-    # Movie parsing
-    # -------------------------
+    def _handle_error(self, failure):
+        """Handle 404 errors for movies not on Metacritic."""
+        title = failure.request.meta.get("title", "Unknown")
+        self.logger.warning(f"Failed to fetch Metacritic for: {title}")
 
     def parse_movie(self, response):
-        # Extract slug from URL.
+        """Parse movie page and queue review pages."""
+        movie_id = response.meta.get("imdb_movie_id")
         slug = self._extract_slug(response.url)
 
-        # Stop if slug missing.
         if not slug:
             return
 
-        # Use IMDB movie_id if available (from search), otherwise generate hash.
-        imdb_movie_id = response.meta.get("imdb_movie_id")
-        if imdb_movie_id:
-            movie_id = imdb_movie_id
-            self.logger.info(f"Using IMDB movie_id: {movie_id} for {slug}")
-        else:
-            # Fallback to hash-based ID for direct URL scraping.
-            movie_id = self._stable_id(f"movie:{slug}")
+        self.movies_scraped += 1
+        self.logger.info(f"[{self.movies_scraped}] Parsing: {response.meta.get('title')}")
 
-        # Parse JSON-LD for stable fields if present.
-        ld_movie = self._extract_jsonld_movie(response)
-
-        # Extract title from JSON-LD if available.
-        title_on_site = self._safe_strip((ld_movie or {}).get("name"))
-
-        # Fallback title from h1.
-        if not title_on_site:
-            title_on_site = self._safe_strip(response.css("h1::text").get())
-
-        # Make one clean text version of the whole page (easier parsing).
+        # Extract basic info
         page_text = self._page_text(response)
-
-        # Release date from JSON-LD or page text.
-        release_date = self._extract_release_date(page_text, ld_movie)
-
-        # Runtime minutes (Updated Logic).
-        runtime_minutes = self._extract_runtime_minutes(response, page_text, ld_movie)
-
-        # Content rating from JSON-LD or page text.
-        content_rating = self._extract_content_rating(page_text, ld_movie)
-
-        # Extract summary from JSON-LD description if possible.
-        summary = self._safe_strip((ld_movie or {}).get("description"))
-
-        # Fallback summary from description area.
-        if not summary:
-            summary = self._safe_strip(" ".join(response.css('div[class*="description"] *::text').getall() or []))
-
-        # Metascore as 0-100 (Updated Logic).
         metascore = self._extract_metascore(response, page_text)
-
-        # User score as 0.0-10.0.
         user_score = self._extract_userscore(page_text)
 
-        # Critic review count (Based on X Critic Reviews).
-        critic_review_count = self._extract_based_on_count(page_text, kind="critic")
-
-        # User rating count (Based on Y User Ratings).
-        user_rating_count = self._extract_based_on_count(page_text, kind="user")
-
-        # Extract distributions (positive/mixed/negative), best-effort.
-        c_pos, c_mix, c_neg = self._extract_distribution_counts(page_text, kind="critic")
-        u_pos, u_mix, u_neg = self._extract_distribution_counts(page_text, kind="user")
-
-        # Yield metacritic_movie item.
+        # Yield movie item with scores
         yield MetacriticMovieItem(
             movie_id=movie_id,
             metacritic_url=response.url,
             metacritic_slug=slug,
-            title_on_site=title_on_site,
-            release_date=release_date,
-            runtime_minutes=runtime_minutes,
-            content_rating=content_rating,
-            summary=summary,
+            title_on_site=response.css("h1::text").get(),
             metascore=metascore,
-            critic_review_count=critic_review_count,
             user_score=user_score,
-            user_rating_count=user_rating_count,
+            critic_review_count=self._extract_review_count(page_text, "critic"),
+            user_rating_count=self._extract_review_count(page_text, "user"),
             scraped_at=datetime.now().isoformat(),
         )
 
-        # Yield metacritic_score_summary item.
-        yield MetacriticScoreSummaryItem(
-            movie_id=movie_id,
-            critic_positive_count=c_pos,
-            critic_mixed_count=c_mix,
-            critic_negative_count=c_neg,
-            user_positive_count=u_pos,
-            user_mixed_count=u_mix,
-            user_negative_count=u_neg,
-            scraped_at=datetime.now().isoformat(),
-        )
-
-        # Yield people + roles.
-        yield from self._yield_people_roles(response, movie_id)
-
-        # Yield production companies.
-        yield from self._yield_production_companies(page_text, movie_id)
-
-        # Yield awards best-effort (if pattern exists).
-        yield from self._yield_awards(page_text, movie_id)
-
-        # Build review page URLs.
-        critic_base = f"https://www.metacritic.com/movie/{slug}/critic-reviews/"
-        user_base = f"https://www.metacritic.com/movie/{slug}/user-reviews/"
-
-        # Queue critic review pages.
+        # Queue critic review pages
         for p in range(self.max_review_pages):
-            # Build URL for page p.
-            url = critic_base if p == 0 else f"{critic_base}?page={p}"
-            # Request critic reviews.
+            url = f"https://www.metacritic.com/movie/{slug}/critic-reviews/"
+            if p > 0:
+                url += f"?page={p}"
             yield scrapy.Request(
                 url=url,
                 callback=self.parse_critic_reviews,
-                meta={**self._detail_meta(), "movie_id": movie_id},
-                priority=40,
+                meta={"movie_id": movie_id},
             )
 
-        # Queue user review pages.
+        # Queue user review pages
         for p in range(self.max_review_pages):
-            # Build URL for page p.
-            url = user_base if p == 0 else f"{user_base}?page={p}"
-            # Request user reviews.
+            url = f"https://www.metacritic.com/movie/{slug}/user-reviews/"
+            if p > 0:
+                url += f"?page={p}"
             yield scrapy.Request(
                 url=url,
                 callback=self.parse_user_reviews,
-                meta={**self._detail_meta(), "movie_id": movie_id},
-                priority=40,
+                meta={"movie_id": movie_id},
             )
 
-    # -------------------------
-    # Critic reviews parsing
-    # -------------------------
-
     def parse_critic_reviews(self, response):
-        # Read movie_id from meta.
+        """Parse critic reviews page."""
         movie_id = response.meta.get("movie_id")
-
-        # Get cleaned text tokens from the page.
         tokens = self._tokens(response)
-
-        # Parse critic reviews from token stream.
         reviews = self._parse_critic_reviews_from_tokens(tokens)
 
-        # Limit how many we store.
-        for idx, r in enumerate(reviews[: self.max_reviews_per_movie], start=1):
-            # Publication handling.
-            publication_id = None
-            pub_name = r.get("publication_name")
-            pub_url = r.get("publication_url")
-
-            # If we have publication name, create stable ID and yield it once.
-            if pub_name:
-                pub_key = pub_name.lower().strip()
-                publication_id = self._stable_id(f"publication:{pub_key}")
-                if pub_key not in self.seen_publications:
-                    self.seen_publications.add(pub_key)
-                    yield MetacriticPublicationItem(
-                        publication_id=publication_id,
-                        name=pub_name,
-                        publication_url=pub_url,
-                    )
-
-            # Yield critic review row.
+        for idx, r in enumerate(reviews[:self.max_reviews_per_movie], start=1):
             yield MetacriticCriticReviewItem(
-                critic_review_id=self._stable_id(f"critic_review:{movie_id}:{response.url}:{idx}"),
+                critic_review_id=self._stable_id(f"critic:{movie_id}:{idx}:{response.url}"),
                 movie_id=movie_id,
-                publication_id=publication_id,
+                publication_name=r.get("publication_name"),
                 critic_name=r.get("critic_name"),
                 score=r.get("score"),
                 review_date=r.get("review_date"),
                 excerpt=r.get("excerpt"),
-                full_review_url=r.get("full_review_url"),
                 scraped_at=datetime.now().isoformat(),
             )
 
-    # -------------------------
-    # User reviews parsing
-    # -------------------------
-
     def parse_user_reviews(self, response):
-        # Read movie_id from meta.
+        """Parse user reviews page."""
         movie_id = response.meta.get("movie_id")
-
-        # Get cleaned text tokens from the page.
         tokens = self._tokens(response)
-
-        # Parse user reviews from token stream.
         reviews = self._parse_user_reviews_from_tokens(tokens)
 
-        # Limit how many we store.
-        for idx, r in enumerate(reviews[: self.max_reviews_per_movie], start=1):
-            # User handling.
-            metacritic_user_id = None
-            username = r.get("username")
-            profile_url = r.get("profile_url")
-
-            # Yield user only once.
-            if username:
-                user_key = username.lower().strip()
-                metacritic_user_id = self._stable_id(f"user:{user_key}")
-                if user_key not in self.seen_users:
-                    self.seen_users.add(user_key)
-                    yield MetacriticUserItem(
-                        metacritic_user_id=metacritic_user_id,
-                        username=username,
-                        profile_url=profile_url,
-                        scraped_at=datetime.now().isoformat(),
-                    )
-
-            # Yield user review row.
+        for idx, r in enumerate(reviews[:self.max_reviews_per_movie], start=1):
             yield MetacriticUserReviewItem(
-                user_review_id=self._stable_id(f"user_review:{movie_id}:{metacritic_user_id}:{response.url}:{idx}"),
+                user_review_id=self._stable_id(f"user:{movie_id}:{idx}:{response.url}"),
                 movie_id=movie_id,
-                metacritic_user_id=metacritic_user_id,
+                username=r.get("username"),
                 score=r.get("score"),
                 review_date=r.get("review_date"),
                 review_text=r.get("review_text"),
-                helpful_count=r.get("helpful_count"),
-                unhelpful_count=r.get("unhelpful_count"),
                 scraped_at=datetime.now().isoformat(),
             )
 
     # -------------------------
-    # Meta and Playwright helpers
+    # Helper methods
     # -------------------------
 
-    def _browse_meta(self) -> Dict[str, Any]:
-        if not self.use_playwright_on_browse:
-            return {}
-        return {
-            "playwright": True,
-            "playwright_include_page": False,
-            "playwright_page_goto_kwargs": {"wait_until": "domcontentloaded", "timeout": 120000},
-        }
-
-    def _detail_meta(self) -> Dict[str, Any]:
-        if not self.use_playwright_on_detail:
-            return {}
-        return {
-            "playwright": True,
-            "playwright_include_page": False,
-            "playwright_page_goto_kwargs": {"wait_until": "domcontentloaded", "timeout": 120000},
-        }
-
-    # -------------------------
-    # ERD yield helpers
-    # -------------------------
-
-    def _yield_people_roles(self, response, movie_id: int):
-        directors = self._split_list(self._detail_value(response, "Directed By"))
-        writers = self._split_list(self._detail_value(response, "Written By"))
-        actors = self._extract_top_cast_pairs(response)
-
-        for name in directors:
-            yield from self._yield_person_role(movie_id, name, "director", None, None)
-
-        for name in writers:
-            yield from self._yield_person_role(movie_id, name, "writer", None, None)
-
-        for idx, (actor_name, character_name) in enumerate(actors[:15], start=1):
-            yield from self._yield_person_role(movie_id, actor_name, "actor", character_name, idx)
-
-    def _yield_person_role(
-        self,
-        movie_id: int,
-        person_name: str,
-        role_type: str,
-        character_name: Optional[str],
-        billing_order: Optional[int],
-    ):
-        key = (person_name or "").strip().lower()
-        if not key:
-            return
-
-        person_id = self._stable_id(f"person:{key}")
-
-        if key not in self.seen_persons:
-            self.seen_persons.add(key)
-            yield PersonItem(
-                person_id=person_id,
-                name=person_name.strip(),
-                metacritic_person_url=None,
-                scraped_at=datetime.now().isoformat(),
-            )
-
-        yield MoviePersonRoleItem(
-            movie_person_role_id=self._stable_id(f"mpr:{movie_id}:{person_id}:{role_type}:{billing_order or 0}"),
-            movie_id=movie_id,
-            person_id=person_id,
-            role_type=role_type,
-            character_name=character_name,
-            billing_order=billing_order,
-            scraped_at=datetime.now().isoformat(),
-        )
-
-    def _yield_production_companies(self, page_text: str, movie_id: int):
-        candidates = re.findall(r"\b([A-Z][A-Za-z0-9&.' -]{2,60} Entertainment)\b", page_text)
-        companies = []
-        for c in candidates:
-            c = (c or "").strip()
-            if c and c not in companies:
-                companies.append(c)
-
-        if not companies:
-            return
-
-        for name in companies[:5]:
-            key = name.strip().lower()
-            prodco_id = self._stable_id(f"prodco:{key}")
-
-            if key not in self.seen_prodcos:
-                self.seen_prodcos.add(key)
-                yield ProductionCompanyItem(
-                    production_company_id=prodco_id,
-                    name=name.strip(),
-                    scraped_at=datetime.now().isoformat(),
-                )
-
-            yield MovieProductionCompanyItem(
-                movie_id=movie_id,
-                production_company_id=prodco_id,
-                scraped_at=datetime.now().isoformat(),
-            )
-
-    def _yield_awards(self, page_text: str, movie_id: int):
-        matches = re.findall(
-            r"([A-Za-z0-9 '&-]{3,60}):\s*(\d+)\s*wins?,\s*(\d+)\s*nominations?",
-            page_text,
-            flags=re.IGNORECASE,
-        )
-
-        for (org_name, wins, noms) in matches:
-            org_clean = (org_name or "").strip()
-            key = org_clean.lower()
-            if not key:
-                continue
-
-            award_org_id = self._stable_id(f"award:{key}")
-
-            if key not in self.seen_awards:
-                self.seen_awards.add(key)
-                yield AwardOrgItem(
-                    award_org_id=award_org_id,
-                    name=org_clean,
-                    award_org_url=None,
-                    scraped_at=datetime.now().isoformat(),
-                )
-
-            yield MovieAwardSummaryItem(
-                movie_award_summary_id=self._stable_id(f"ma:{movie_id}:{award_org_id}"),
-                movie_id=movie_id,
-                award_org_id=award_org_id,
-                wins=int(wins),
-                nominations=int(noms),
-                scraped_at=datetime.now().isoformat(),
-            )
-
-    # -------------------------
-    # Core extraction helpers
-    # -------------------------
-
-    def _extract_slug(self, url_or_path: str) -> Optional[str]:
-        m = re.search(r"/movie/([^/]+)/?(?:\?.*)?$", url_or_path or "")
+    def _extract_slug(self, url: str) -> Optional[str]:
+        m = re.search(r"/movie/([^/]+)/?", url)
         return m.group(1) if m else None
 
     def _stable_id(self, text: str) -> int:
-        checksum = zlib.adler32(text.encode("utf-8"))
-        return int(10_000_000_000 + checksum)
-
-    def _safe_strip(self, s: Any) -> Optional[str]:
-        if s is None:
-            return None
-        s = str(s)
-        s = s.strip()
-        return s if s else None
-
-    def _split_list(self, text: Optional[str]) -> List[str]:
-        if not text:
-            return []
-        parts = [p.strip() for p in text.split(",")]
-        return [p for p in parts if p]
+        return int(10_000_000_000 + zlib.adler32(text.encode("utf-8")))
 
     def _page_text(self, response) -> str:
         parts = response.css("body *::text").getall() or []
-        parts = [p.strip() for p in parts if p and p.strip()]
-        text = " ".join(parts)
-        text = re.sub(r"\s+", " ", text).strip()
-        return text
+        return " ".join(p.strip() for p in parts if p.strip())
 
     def _tokens(self, response) -> List[str]:
         parts = response.css("body *::text").getall() or []
-        tokens = []
-        for p in parts:
-            p = (p or "").strip()
-            if not p:
-                continue
-            p = re.sub(r"\s+", " ", p).strip()
-            if p:
-                tokens.append(p)
-        return tokens
-
-    def _extract_jsonld_movie(self, response) -> Optional[Dict[str, Any]]:
-        scripts = response.xpath('//script[@type="application/ld+json"]/text()').getall() or []
-        for raw in scripts:
-            raw = (raw or "").strip()
-            if not raw:
-                continue
-            try:
-                data = json.loads(raw)
-            except Exception:
-                continue
-            candidates = data if isinstance(data, list) else [data]
-            for obj in candidates:
-                if not isinstance(obj, dict):
-                    continue
-                if "@graph" in obj and isinstance(obj["@graph"], list):
-                    for g in obj["@graph"]:
-                        if isinstance(g, dict) and g.get("@type") in ("Movie", "Film"):
-                            return g
-                if obj.get("@type") in ("Movie", "Film"):
-                    return obj
-        return None
-
-    def _detail_value(self, response, label: str) -> Optional[str]:
-        xp = f'//*[self::li or self::div or self::span][.//text()[contains(., "{label}")]]'
-        node_html = response.xpath(xp).get()
-        if not node_html:
-            return None
-        txt = " ".join(Selector(text=node_html).css("::text").getall() or [])
-        txt = re.sub(r"\s+", " ", txt).strip()
-        txt = txt.replace(label, "").strip(" :|-")
-        return txt if txt else None
-
-    # -------------------------
-    # Field parsing from text
-    # -------------------------
-
-    def _extract_release_date(self, text: str, ld_movie: Optional[Dict[str, Any]]) -> Optional[str]:
-        if ld_movie:
-            dp = ld_movie.get("datePublished")
-            if isinstance(dp, str) and dp.strip():
-                return dp.strip()
-
-        m = re.search(r"\bRelease Date\s+([A-Z][a-z]{2}\s+\d{1,2},\s+\d{4})\b", text)
-        if m:
-            return m.group(1).strip()
-
-        return None
-
-    def _extract_runtime_minutes(self, response, text: str, ld_movie: Optional[Dict[str, Any]]) -> Optional[int]:
-        """
-        Calculates minutes based on "1 h 36 m" format.
-        Formula: hours * 60 + minutes.
-        """
-        # 1. Try JSON-LD first (cleanest)
-        if ld_movie:
-            dur = ld_movie.get("duration")
-            if isinstance(dur, str):
-                m = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?", dur)
-                if m:
-                    h = int(m.group(1)) if m.group(1) else 0
-                    mn = int(m.group(2)) if m.group(2) else 0
-                    total = h * 60 + mn
-                    if total > 0:
-                        return total
-
-        # 2. Try Regex on the specific text format from the site: "1 h 36 m"
-        # Using the page text or specifically looking into span tags is safer than class names that might change.
-        
-        # Pattern for "1 h 36 m"
-        m_full = re.search(r'(\d+)\s*h\s*(\d+)\s*m', text)
-        if m_full:
-            hours = int(m_full.group(1))
-            minutes = int(m_full.group(2))
-            return hours * 60 + minutes
-
-        # Pattern for just "2 h" (exact hour count)
-        m_hours = re.search(r'(\d+)\s*h(?![\w\s]*m)', text)
-        if m_hours:
-            return int(m_hours.group(1)) * 60
-
-        # Pattern for just "96 min" or "96 m"
-        m_mins = re.search(r'(\d+)\s*(?:min|m)\b', text)
-        if m_mins:
-            val = int(m_mins.group(1))
-            # Sanity check: reasonable movie length (10 to 400 mins)
-            if 10 <= val <= 400:
-                return val
-
-        return None
-
-    def _extract_content_rating(self, text: str, ld_movie: Optional[Dict[str, Any]]) -> Optional[str]:
-        if ld_movie:
-            cr = ld_movie.get("contentRating")
-            if isinstance(cr, str) and cr.strip():
-                return cr.strip()
-
-        m = re.search(r"\bRating\s+(G|PG|PG-13|R|NC-17|NR|Not Rated|TV-MA|TV-14|TV-PG)\b", text)
-        if m:
-            return m.group(1).strip()
-
-        return None
+        return [re.sub(r"\s+", " ", p).strip() for p in parts if p.strip()]
 
     def _extract_metascore(self, response, text: str) -> Optional[int]:
-        """
-        Fixed logic to extract the actual Metascore, not the review count.
-        """
-        # 1. Try CSS Selector (Best for accuracy)
-        # Look for the score box specifically
-        score_box = response.css('.c-productScoreInfo_scoreNumber span::text').get()
-        if score_box and score_box.strip().isdigit():
-            return int(score_box.strip())
-
-        # 2. JSON-LD Fallback
-        # Sometimes hidden in aggregateRating
-        # (Already parsed in _extract_jsonld_movie, but usually Metacritic JSON uses 1-10 scale for agg rating)
-        
-        # 3. Text Regex Fallback (Improved)
-        # Look for "Metascore" followed by a number, but ensure it's not followed by "reviews"
-        # Matches "Metascore 85"
-        m = re.search(r"\bMetascore\b\s*(\d{1,3})(?!\s*reviews)", text, flags=re.IGNORECASE)
-        if m:
-            val = int(m.group(1))
-            if 0 <= val <= 100:
-                return val
-        
-        # If that fails, look for the big score number pattern if "Metascore" text is split
-        # This is risky, so we rely on the CSS selector mostly.
-        
+        # Try CSS selector first
+        score = response.css('.c-productScoreInfo_scoreNumber span::text').get()
+        if score and score.strip().isdigit():
+            return int(score.strip())
+        # Regex fallback
+        m = re.search(r"\bMetascore\b\s*(\d{1,3})(?!\s*reviews)", text, re.IGNORECASE)
+        if m and 0 <= int(m.group(1)) <= 100:
+            return int(m.group(1))
         return None
 
     def _extract_userscore(self, text: str) -> Optional[float]:
-        m = re.search(r"\bUser Score\b.*?\b(\d{1,2}\.\d)\b", text, flags=re.IGNORECASE)
+        m = re.search(r"\bUser Score\b.*?\b(\d{1,2}\.?\d?)\b", text, re.IGNORECASE)
         if m:
             val = float(m.group(1))
             if 0.0 <= val <= 10.0:
                 return val
-
-        m = re.search(r"\bUser Score\b.*?\b(\d{1,2})\b", text, flags=re.IGNORECASE)
-        if m:
-            val = float(m.group(1))
-            if 0.0 <= val <= 10.0:
-                return val
-
         return None
 
-    def _extract_based_on_count(self, text: str, kind: str) -> Optional[int]:
+    def _extract_review_count(self, text: str, kind: str) -> Optional[int]:
         if kind == "critic":
-            m = re.search(r"\bBased on\s+([\d,]+)\s+Critic Reviews\b", text, flags=re.IGNORECASE)
-            if not m:
-                return None
-            return int(m.group(1).replace(",", ""))
-
-        m = re.search(r"\bBased on\s+([\d,]+)\s+User Ratings\b", text, flags=re.IGNORECASE)
-        if not m:
-            return None
-        return int(m.group(1).replace(",", ""))
-
-    def _extract_distribution_counts(self, text: str, kind: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
-        if kind == "critic":
-            m = re.search(
-                r"\bPositive\b\s+(\d+)\s+Reviews?\b.*?\bMixed\b\s+(\d+)\s+Reviews?\b.*?\bNegative\b\s+(\d+)\s+Reviews?\b",
-                text,
-                flags=re.IGNORECASE,
-            )
-            if not m:
-                return None, None, None
-            return int(m.group(1)), int(m.group(2)), int(m.group(3))
-
-        m = re.search(
-            r"\bPositive\b\s+(\d+)\s+Ratings?\b.*?\bMixed\b\s+(\d+)\s+Ratings?\b.*?\bNegative\b\s+(\d+)\s+Ratings?\b",
-            text,
-            flags=re.IGNORECASE,
-        )
-        if not m:
-            return None, None, None
-        return int(m.group(1)), int(m.group(2)), int(m.group(3))
-
-    # -------------------------
-    # Cast parsing
-    # -------------------------
-
-    def _extract_top_cast_pairs(self, response) -> List[Tuple[str, Optional[str]]]:
-        raw = response.css('a[href*="/person/"]::text').getall() or []
-        raw = [re.sub(r"\s+", " ", (x or "").strip()) for x in raw if (x or "").strip()]
-
-        pairs = []
-        seen = set()
-
-        for t in raw:
-            key = t.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-
-            if t.lower() in ("view all", "view all cast & crew"):
-                continue
-
-            parts = t.split(" ")
-            if len(parts) <= 2:
-                pairs.append((t, None))
-                continue
-
-            actor_name = " ".join(parts[:2]).strip()
-            character_name = " ".join(parts[2:]).strip()
-
-            if len(character_name) < 2:
-                character_name = None
-
-            pairs.append((actor_name, character_name))
-
-        return pairs
-
-    # -------------------------
-    # Review parsing from tokens
-    # -------------------------
+            m = re.search(r"\bBased on\s+([\d,]+)\s+Critic Reviews\b", text, re.IGNORECASE)
+        else:
+            m = re.search(r"\bBased on\s+([\d,]+)\s+User Ratings\b", text, re.IGNORECASE)
+        return int(m.group(1).replace(",", "")) if m else None
 
     def _parse_critic_reviews_from_tokens(self, tokens: List[str]) -> List[Dict[str, Any]]:
         date_re = re.compile(r"^[A-Z][a-z]{2}\s+\d{1,2},\s+\d{4}$")
         score_re = re.compile(r"^\d{1,3}$")
-
         out = []
         i = 0
 
@@ -1071,69 +263,49 @@ class MetacriticSpider(scrapy.Spider):
             review_date = tokens[i]
             i += 1
 
+            # Find score
             score = None
-            score_pos = None
             for j in range(i, min(i + 6, len(tokens))):
                 if score_re.match(tokens[j]):
                     val = int(tokens[j])
                     if 0 <= val <= 100:
                         score = val
-                        score_pos = j
+                        i = j + 1
                         break
 
-            if score is None or score_pos is None:
+            if score is None:
                 continue
 
+            # Find publication name
             pub_name = None
-            for j in range(score_pos + 1, min(score_pos + 6, len(tokens))):
+            for j in range(i, min(i + 4, len(tokens))):
                 if not score_re.match(tokens[j]) and not date_re.match(tokens[j]):
                     if tokens[j].lower() not in ("read more", "report"):
                         pub_name = tokens[j]
+                        i = j + 1
                         break
 
+            # Collect excerpt
             excerpt_parts = []
-            j = (score_pos + 2) if pub_name else (score_pos + 1)
-
-            while j < len(tokens):
-                if tokens[j].lower() == "read more":
+            while i < len(tokens):
+                if tokens[i].lower() == "read more" or date_re.match(tokens[i]):
                     break
-                if date_re.match(tokens[j]):
-                    break
-                if tokens[j].lower() in ("critic reviews", "user reviews", "view all"):
-                    break
-                excerpt_parts.append(tokens[j])
-                j += 1
+                excerpt_parts.append(tokens[i])
+                i += 1
 
-            excerpt = " ".join(excerpt_parts).strip()
-            if not excerpt:
-                excerpt = None
-
-            critic_name = None
-            look = " ".join(tokens[max(0, j - 5): min(len(tokens), j + 5)])
-            m = re.search(r"\bBy\s+([A-Z][A-Za-z .,'-]{2,80})\b", look)
-            if m:
-                critic_name = m.group(1).strip()
-
-            out.append(
-                {
-                    "review_date": review_date,
-                    "score": score,
-                    "publication_name": pub_name,
-                    "publication_url": None,
-                    "excerpt": excerpt,
-                    "critic_name": critic_name,
-                    "full_review_url": None,
-                }
-            )
-
-            i = j + 1
+            out.append({
+                "review_date": review_date,
+                "score": score,
+                "publication_name": pub_name,
+                "excerpt": " ".join(excerpt_parts).strip() or None,
+                "critic_name": None,
+            })
 
         return out
 
     def _parse_user_reviews_from_tokens(self, tokens: List[str]) -> List[Dict[str, Any]]:
         date_re = re.compile(r"^[A-Z][a-z]{2}\s+\d{1,2},\s+\d{4}$")
         score_re = re.compile(r"^\d{1,2}$")
-
         out = []
         i = 0
 
@@ -1148,44 +320,27 @@ class MetacriticSpider(scrapy.Spider):
             if i >= len(tokens) or not score_re.match(tokens[i]):
                 continue
 
-            val = int(tokens[i])
-            if not (0 <= val <= 10):
+            score = int(tokens[i])
+            if not (0 <= score <= 10):
                 continue
-
-            score = val
             i += 1
 
             username = tokens[i] if i < len(tokens) else None
             i += 1
 
+            # Collect review text
             review_parts = []
             while i < len(tokens):
-                low = tokens[i].lower()
-                if low in ("read more", "report"):
-                    break
-                if date_re.match(tokens[i]):
-                    break
-                if low in ("user reviews", "critic reviews", "view all"):
+                if tokens[i].lower() in ("read more", "report") or date_re.match(tokens[i]):
                     break
                 review_parts.append(tokens[i])
                 i += 1
 
-            review_text = " ".join(review_parts).strip()
-            if not review_text:
-                review_text = None
-
-            out.append(
-                {
-                    "review_date": review_date,
-                    "score": score,
-                    "username": username,
-                    "profile_url": None,
-                    "review_text": review_text,
-                    "helpful_count": None,
-                    "unhelpful_count": None,
-                }
-            )
-
-            i += 1
+            out.append({
+                "review_date": review_date,
+                "score": score,
+                "username": username,
+                "review_text": " ".join(review_parts).strip() or None,
+            })
 
         return out

@@ -11,20 +11,11 @@ from itemadapter import ItemAdapter
 # IMDb items
 from imdb_scraper.items import MovieItem, ReviewItem, BoxOfficeMojoItem
 
-# Metacritic (ERD) items
+# Metacritic items (simplified - only reviews)
 from imdb_scraper.items import (
     MetacriticMovieItem,
-    MetacriticScoreSummaryItem,
-    MetacriticUserItem,
-    MetacriticUserReviewItem,
-    MetacriticPublicationItem,
     MetacriticCriticReviewItem,
-    PersonItem,
-    MoviePersonRoleItem,
-    AwardOrgItem,
-    MovieAwardSummaryItem,
-    ProductionCompanyItem,
-    MovieProductionCompanyItem,
+    MetacriticUserReviewItem,
 )
 
 
@@ -39,23 +30,19 @@ class CsvPipeline:
         # File handles and writers
         self.files = {}
         self.writers = {}
-        
+
         # Deduplication sets (to mimic DB unique constraints within session)
         self.seen_genres = set()
         self.seen_directors = set()
         self.seen_actors = set()
-        self.seen_persons = set()
-        self.seen_publications = set()
-        self.seen_prodcos = set()
-        self.seen_awards = set()
-        self.seen_users = set()
         # Junction table deduplication (movie_id, person_id pairs)
         self.seen_movie_directors = set()
         self.seen_movie_actors = set()
         self.seen_movie_genres = set()
-        
+
         # Define schemas
         self.schemas = {
+            # IMDb tables
             "movie": ["movie_id", "title", "year", "user_score", "box_office", "genres", "scraped_at"],
             "imdb_reviews": ["movie_id", "author", "score", "text", "is_critic", "review_date", "scraped_at"],
             "imdb_genres": ["genre_id", "genre"],
@@ -64,25 +51,14 @@ class CsvPipeline:
             "imdb_movie_directors": ["movie_id", "director_id", "director_order"],
             "imdb_actors": ["actor_id", "name", "imdb_person_id"],
             "imdb_movie_cast": ["movie_id", "actor_id", "character_name", "cast_order"],
-            "metacritic_data": ["movie_id", "metacritic_slug", "metascore", "metacritic_user_score", 
+            # Metacritic tables (simplified - only reviews)
+            "metacritic_data": ["movie_id", "metacritic_slug", "metascore", "metacritic_user_score",
                               "critic_review_count", "user_rating_count", "scraped_at"],
-            "metacritic_score_summary": ["movie_id", "critic_positive_count", "critic_mixed_count", 
-                                       "critic_negative_count", "user_positive_count", "user_mixed_count", 
-                                       "user_negative_count", "scraped_at"],
-            "metacritic_users": ["metacritic_user_id", "username", "profile_url", "scraped_at"],
-            "metacritic_user_reviews": ["user_review_id", "movie_id", "metacritic_user_id", "score", 
-                                      "review_date", "review_text", "helpful_count", "unhelpful_count", "scraped_at"],
-            "metacritic_publications": ["publication_id", "name", "publication_url"],
-            "metacritic_critic_reviews": ["critic_review_id", "movie_id", "publication_id", "critic_name", 
-                                        "score", "review_date", "excerpt", "full_review_url", "scraped_at"],
-            "metacritic_people": ["person_id", "name", "metacritic_person_url", "scraped_at"],
-            "metacritic_movie_person_roles": ["movie_person_role_id", "movie_id", "person_id", "role_type", 
-                                 "character_name", "billing_order", "scraped_at"],
-            "metacritic_production_companies": ["production_company_id", "name", "scraped_at"],
-            "metacritic_movie_production_companies": ["movie_id", "production_company_id", "scraped_at"],
-            "metacritic_award_orgs": ["award_org_id", "name", "award_org_url", "scraped_at"],
-            "metacritic_movie_award_summaries": ["movie_award_summary_id", "movie_id", "award_org_id", "wins",
-                                    "nominations", "scraped_at"],
+            "metacritic_critic_reviews": ["critic_review_id", "movie_id", "publication_name", "critic_name",
+                                        "score", "review_date", "excerpt", "scraped_at"],
+            "metacritic_user_reviews": ["user_review_id", "movie_id", "username", "score",
+                                      "review_date", "review_text", "scraped_at"],
+            # Box Office Mojo table
             "box_office_data": ["movie_id", "production_budget", "domestic_opening", "domestic_total",
                                "international_total", "worldwide_total", "scraped_at"]
         }
@@ -214,59 +190,24 @@ class CsvPipeline:
             self.writers["imdb_reviews"].writerow(adapter.asdict())
 
         # -------------------------
-        # Metacritic Items
+        # Metacritic Items (simplified)
         # -------------------------
         elif isinstance(item, MetacriticMovieItem):
-            row = {k: adapter.get(k) for k in self.schemas["metacritic_data"] if k in item}
-            self.writers["metacritic_data"].writerow(row)
-
-        elif isinstance(item, MetacriticScoreSummaryItem):
-            self.writers["metacritic_score_summary"].writerow(adapter.asdict())
-
-        elif isinstance(item, MetacriticUserItem):
-            uid = adapter.get("metacritic_user_id")
-            if uid not in self.seen_users:
-                 self.seen_users.add(uid)
-                 self.writers["metacritic_users"].writerow(adapter.asdict())
-
-        elif isinstance(item, MetacriticUserReviewItem):
-             self.writers["metacritic_user_reviews"].writerow(adapter.asdict())
-
-        elif isinstance(item, MetacriticPublicationItem):
-            pid = adapter.get("publication_id")
-            if pid not in self.seen_publications:
-                self.seen_publications.add(pid)
-                self.writers["metacritic_publications"].writerow(adapter.asdict())
+            self.writers["metacritic_data"].writerow({
+                "movie_id": adapter.get("movie_id"),
+                "metacritic_slug": adapter.get("metacritic_slug"),
+                "metascore": adapter.get("metascore"),
+                "metacritic_user_score": adapter.get("user_score"),
+                "critic_review_count": adapter.get("critic_review_count"),
+                "user_rating_count": adapter.get("user_rating_count"),
+                "scraped_at": adapter.get("scraped_at"),
+            })
 
         elif isinstance(item, MetacriticCriticReviewItem):
-             self.writers["metacritic_critic_reviews"].writerow(adapter.asdict())
+            self.writers["metacritic_critic_reviews"].writerow(adapter.asdict())
 
-        elif isinstance(item, PersonItem):
-            pid = adapter.get("person_id")
-            if pid not in self.seen_persons:
-                self.seen_persons.add(pid)
-                self.writers["metacritic_people"].writerow(adapter.asdict())
-
-        elif isinstance(item, MoviePersonRoleItem):
-             self.writers["metacritic_movie_person_roles"].writerow(adapter.asdict())
-
-        elif isinstance(item, ProductionCompanyItem):
-             pid = adapter.get("production_company_id")
-             if pid not in self.seen_prodcos:
-                 self.seen_prodcos.add(pid)
-                 self.writers["metacritic_production_companies"].writerow(adapter.asdict())
-
-        elif isinstance(item, MovieProductionCompanyItem):
-             self.writers["metacritic_movie_production_companies"].writerow(adapter.asdict())
-
-        elif isinstance(item, AwardOrgItem):
-             aid = adapter.get("award_org_id")
-             if aid not in self.seen_awards:
-                 self.seen_awards.add(aid)
-                 self.writers["metacritic_award_orgs"].writerow(adapter.asdict())
-
-        elif isinstance(item, MovieAwardSummaryItem):
-             self.writers["metacritic_movie_award_summaries"].writerow(adapter.asdict())
+        elif isinstance(item, MetacriticUserReviewItem):
+            self.writers["metacritic_user_reviews"].writerow(adapter.asdict())
 
         # -------------------------
         # Box Office Mojo Items
@@ -320,7 +261,7 @@ class SqlitePipeline:
     def _create_tables(self):
         self.cur.executescript("""
             -- =========================================================
-            -- IMDb TABLES (existing structure)
+            -- IMDb TABLES
             -- =========================================================
 
             CREATE TABLE IF NOT EXISTS movie (
@@ -383,122 +324,42 @@ class SqlitePipeline:
             );
 
             -- =========================================================
-            -- METACRITIC DATA (extends movie table, FK to movie.movie_id)
+            -- METACRITIC TABLES (simplified - only reviews)
             -- =========================================================
 
-            -- Metacritic-specific data for movies (1:1 with movie table)
             CREATE TABLE IF NOT EXISTS metacritic_data (
                 movie_id INTEGER PRIMARY KEY REFERENCES movie(movie_id),
-                metacritic_url TEXT,
                 metacritic_slug VARCHAR(255),
-                title_on_metacritic VARCHAR(255),
                 metascore INTEGER,
                 metacritic_user_score DECIMAL(3,1),
                 critic_review_count INTEGER,
                 user_rating_count INTEGER,
-                content_rating VARCHAR(50),
-                runtime_minutes INTEGER,
-                summary TEXT,
                 scraped_at DATETIME NOT NULL
             );
 
-            -- Score breakdown (positive/mixed/negative counts)
-            CREATE TABLE IF NOT EXISTS metacritic_score_summary (
-                movie_id INTEGER PRIMARY KEY REFERENCES movie(movie_id),
-                critic_positive_count INTEGER,
-                critic_mixed_count INTEGER,
-                critic_negative_count INTEGER,
-                user_positive_count INTEGER,
-                user_mixed_count INTEGER,
-                user_negative_count INTEGER,
-                scraped_at DATETIME NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS metacritic_user (
-                metacritic_user_id INTEGER PRIMARY KEY,
-                username VARCHAR(255),
-                profile_url TEXT,
+            CREATE TABLE IF NOT EXISTS metacritic_critic_review (
+                critic_review_id INTEGER PRIMARY KEY,
+                movie_id INTEGER REFERENCES movie(movie_id),
+                publication_name VARCHAR(255),
+                critic_name VARCHAR(255),
+                score INTEGER,
+                review_date VARCHAR(50),
+                excerpt TEXT,
                 scraped_at DATETIME NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS metacritic_user_review (
                 user_review_id INTEGER PRIMARY KEY,
                 movie_id INTEGER REFERENCES movie(movie_id),
-                metacritic_user_id INTEGER REFERENCES metacritic_user(metacritic_user_id),
+                username VARCHAR(255),
                 score INTEGER,
                 review_date VARCHAR(50),
                 review_text TEXT,
-                helpful_count INTEGER,
-                unhelpful_count INTEGER,
-                scraped_at DATETIME NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS metacritic_publication (
-                publication_id INTEGER PRIMARY KEY,
-                name VARCHAR(255),
-                publication_url TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS metacritic_critic_review (
-                critic_review_id INTEGER PRIMARY KEY,
-                movie_id INTEGER REFERENCES movie(movie_id),
-                publication_id INTEGER REFERENCES metacritic_publication(publication_id),
-                critic_name VARCHAR(255),
-                score INTEGER,
-                review_date VARCHAR(50),
-                excerpt TEXT,
-                full_review_url TEXT,
-                scraped_at DATETIME NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS person (
-                person_id INTEGER PRIMARY KEY,
-                name VARCHAR(255),
-                metacritic_person_url TEXT,
-                scraped_at DATETIME NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS movie_person_role (
-                movie_person_role_id INTEGER PRIMARY KEY,
-                movie_id INTEGER REFERENCES movie(movie_id),
-                person_id INTEGER REFERENCES person(person_id),
-                role_type VARCHAR(50),
-                character_name VARCHAR(255),
-                billing_order INTEGER,
-                scraped_at DATETIME NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS production_company (
-                production_company_id INTEGER PRIMARY KEY,
-                name VARCHAR(255),
-                scraped_at DATETIME NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS movie_production_company (
-                movie_id INTEGER REFERENCES movie(movie_id),
-                production_company_id INTEGER REFERENCES production_company(production_company_id),
-                scraped_at DATETIME NOT NULL,
-                PRIMARY KEY (movie_id, production_company_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS award_org (
-                award_org_id INTEGER PRIMARY KEY,
-                name VARCHAR(255),
-                award_org_url TEXT,
-                scraped_at DATETIME NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS movie_award_summary (
-                movie_award_summary_id INTEGER PRIMARY KEY,
-                movie_id INTEGER REFERENCES movie(movie_id),
-                award_org_id INTEGER REFERENCES award_org(award_org_id),
-                wins INTEGER,
-                nominations INTEGER,
                 scraped_at DATETIME NOT NULL
             );
 
             -- =========================================================
-            -- BOX OFFICE MOJO DATA (extends movie table, FK to movie.movie_id)
+            -- BOX OFFICE MOJO TABLE
             -- =========================================================
 
             CREATE TABLE IF NOT EXISTS box_office_data (
@@ -527,31 +388,13 @@ class SqlitePipeline:
         elif isinstance(item, ReviewItem):
             self._save_imdb_review(adapter)
 
-        # Metacritic
+        # Metacritic (simplified)
         elif isinstance(item, MetacriticMovieItem):
             self._save_metacritic_movie(adapter)
-        elif isinstance(item, MetacriticScoreSummaryItem):
-            self._save_metacritic_score_summary(adapter)
-        elif isinstance(item, MetacriticUserItem):
-            self._save_metacritic_user(adapter)
-        elif isinstance(item, MetacriticUserReviewItem):
-            self._save_metacritic_user_review(adapter)
-        elif isinstance(item, MetacriticPublicationItem):
-            self._save_metacritic_publication(adapter)
         elif isinstance(item, MetacriticCriticReviewItem):
             self._save_metacritic_critic_review(adapter)
-        elif isinstance(item, PersonItem):
-            self._save_person(adapter)
-        elif isinstance(item, MoviePersonRoleItem):
-            self._save_movie_person_role(adapter)
-        elif isinstance(item, ProductionCompanyItem):
-            self._save_production_company(adapter)
-        elif isinstance(item, MovieProductionCompanyItem):
-            self._save_movie_production_company(adapter)
-        elif isinstance(item, AwardOrgItem):
-            self._save_award_org(adapter)
-        elif isinstance(item, MovieAwardSummaryItem):
-            self._save_movie_award_summary(adapter)
+        elif isinstance(item, MetacriticUserReviewItem):
+            self._save_metacritic_user_review(adapter)
 
         # Box Office Mojo
         elif isinstance(item, BoxOfficeMojoItem):
@@ -647,205 +490,63 @@ class SqlitePipeline:
         return self.cur.lastrowid
 
     # -------------------------
-    # Metacritic save methods
+    # Metacritic save methods (simplified)
     # -------------------------
 
     def _save_metacritic_movie(self, adapter):
-        """Save Metacritic data to metacritic_data table (FK to movie table)."""
+        """Save Metacritic data to metacritic_data table."""
         self.cur.execute("""
             INSERT OR REPLACE INTO metacritic_data (
-                movie_id, metacritic_url, metacritic_slug, title_on_metacritic,
-                metascore, metacritic_user_score, critic_review_count, user_rating_count,
-                content_rating, runtime_minutes, summary, scraped_at
+                movie_id, metacritic_slug, metascore, metacritic_user_score,
+                critic_review_count, user_rating_count, scraped_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (
             adapter.get("movie_id"),
-            adapter.get("metacritic_url"),
             adapter.get("metacritic_slug"),
-            adapter.get("title_on_site"),
             adapter.get("metascore"),
             adapter.get("user_score"),
             adapter.get("critic_review_count"),
             adapter.get("user_rating_count"),
-            adapter.get("content_rating"),
-            adapter.get("runtime_minutes"),
-            adapter.get("summary"),
             adapter.get("scraped_at"),
         ))
         self.conn.commit()
 
-    def _save_metacritic_score_summary(self, adapter):
+    def _save_metacritic_critic_review(self, adapter):
+        """Save Metacritic critic review."""
         self.cur.execute("""
-            INSERT OR REPLACE INTO metacritic_score_summary (
-                movie_id, critic_positive_count, critic_mixed_count, critic_negative_count,
-                user_positive_count, user_mixed_count, user_negative_count, scraped_at
+            INSERT OR REPLACE INTO metacritic_critic_review (
+                critic_review_id, movie_id, publication_name, critic_name,
+                score, review_date, excerpt, scraped_at
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (
+            adapter.get("critic_review_id"),
             adapter.get("movie_id"),
-            adapter.get("critic_positive_count"),
-            adapter.get("critic_mixed_count"),
-            adapter.get("critic_negative_count"),
-            adapter.get("user_positive_count"),
-            adapter.get("user_mixed_count"),
-            adapter.get("user_negative_count"),
-            adapter.get("scraped_at"),
-        ))
-        self.conn.commit()
-
-    def _save_metacritic_user(self, adapter):
-        self.cur.execute("""
-            INSERT OR REPLACE INTO metacritic_user (
-                metacritic_user_id, username, profile_url, scraped_at
-            )
-            VALUES (?, ?, ?, ?)
-        """, (
-            adapter.get("metacritic_user_id"),
-            adapter.get("username"),
-            adapter.get("profile_url"),
+            adapter.get("publication_name"),
+            adapter.get("critic_name"),
+            adapter.get("score"),
+            adapter.get("review_date"),
+            adapter.get("excerpt"),
             adapter.get("scraped_at"),
         ))
         self.conn.commit()
 
     def _save_metacritic_user_review(self, adapter):
+        """Save Metacritic user review."""
         self.cur.execute("""
             INSERT OR REPLACE INTO metacritic_user_review (
-                user_review_id, movie_id, metacritic_user_id, score, review_date,
-                review_text, helpful_count, unhelpful_count, scraped_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            adapter.get("user_review_id"),
-            adapter.get("movie_id"),
-            adapter.get("metacritic_user_id"),
-            adapter.get("score"),
-            adapter.get("review_date"),
-            adapter.get("review_text"),
-            adapter.get("helpful_count"),
-            adapter.get("unhelpful_count"),
-            adapter.get("scraped_at"),
-        ))
-        self.conn.commit()
-
-    def _save_metacritic_publication(self, adapter):
-        self.cur.execute("""
-            INSERT OR REPLACE INTO metacritic_publication (
-                publication_id, name, publication_url
-            )
-            VALUES (?, ?, ?)
-        """, (
-            adapter.get("publication_id"),
-            adapter.get("name"),
-            adapter.get("publication_url"),
-        ))
-        self.conn.commit()
-
-    def _save_metacritic_critic_review(self, adapter):
-        self.cur.execute("""
-            INSERT OR REPLACE INTO metacritic_critic_review (
-                critic_review_id, movie_id, publication_id, critic_name, score,
-                review_date, excerpt, full_review_url, scraped_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            adapter.get("critic_review_id"),
-            adapter.get("movie_id"),
-            adapter.get("publication_id"),
-            adapter.get("critic_name"),
-            adapter.get("score"),
-            adapter.get("review_date"),
-            adapter.get("excerpt"),
-            adapter.get("full_review_url"),
-            adapter.get("scraped_at"),
-        ))
-        self.conn.commit()
-
-    def _save_person(self, adapter):
-        self.cur.execute("""
-            INSERT OR REPLACE INTO person (
-                person_id, name, metacritic_person_url, scraped_at
-            )
-            VALUES (?, ?, ?, ?)
-        """, (
-            adapter.get("person_id"),
-            adapter.get("name"),
-            adapter.get("metacritic_person_url"),
-            adapter.get("scraped_at"),
-        ))
-        self.conn.commit()
-
-    def _save_movie_person_role(self, adapter):
-        self.cur.execute("""
-            INSERT OR REPLACE INTO movie_person_role (
-                movie_person_role_id, movie_id, person_id, role_type,
-                character_name, billing_order, scraped_at
+                user_review_id, movie_id, username, score,
+                review_date, review_text, scraped_at
             )
             VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (
-            adapter.get("movie_person_role_id"),
+            adapter.get("user_review_id"),
             adapter.get("movie_id"),
-            adapter.get("person_id"),
-            adapter.get("role_type"),
-            adapter.get("character_name"),
-            adapter.get("billing_order"),
-            adapter.get("scraped_at"),
-        ))
-        self.conn.commit()
-
-    def _save_production_company(self, adapter):
-        self.cur.execute("""
-            INSERT OR REPLACE INTO production_company (
-                production_company_id, name, scraped_at
-            )
-            VALUES (?, ?, ?)
-        """, (
-            adapter.get("production_company_id"),
-            adapter.get("name"),
-            adapter.get("scraped_at"),
-        ))
-        self.conn.commit()
-
-    def _save_movie_production_company(self, adapter):
-        self.cur.execute("""
-            INSERT OR REPLACE INTO movie_production_company (
-                movie_id, production_company_id, scraped_at
-            )
-            VALUES (?, ?, ?)
-        """, (
-            adapter.get("movie_id"),
-            adapter.get("production_company_id"),
-            adapter.get("scraped_at"),
-        ))
-        self.conn.commit()
-
-    def _save_award_org(self, adapter):
-        self.cur.execute("""
-            INSERT OR REPLACE INTO award_org (
-                award_org_id, name, award_org_url, scraped_at
-            )
-            VALUES (?, ?, ?, ?)
-        """, (
-            adapter.get("award_org_id"),
-            adapter.get("name"),
-            adapter.get("award_org_url"),
-            adapter.get("scraped_at"),
-        ))
-        self.conn.commit()
-
-    def _save_movie_award_summary(self, adapter):
-        self.cur.execute("""
-            INSERT OR REPLACE INTO movie_award_summary (
-                movie_award_summary_id, movie_id, award_org_id,
-                wins, nominations, scraped_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (
-            adapter.get("movie_award_summary_id"),
-            adapter.get("movie_id"),
-            adapter.get("award_org_id"),
-            adapter.get("wins"),
-            adapter.get("nominations"),
+            adapter.get("username"),
+            adapter.get("score"),
+            adapter.get("review_date"),
+            adapter.get("review_text"),
             adapter.get("scraped_at"),
         ))
         self.conn.commit()
