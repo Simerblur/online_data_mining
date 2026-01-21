@@ -72,14 +72,14 @@ class CsvPipeline:
 
         for name, fields in self.schemas.items():
             path = output_dir / f"{name}.csv"
+            # Check if file exists and has content BEFORE opening
+            write_header = not path.exists() or path.stat().st_size == 0
             # Open in append mode
             f = open(path, "a", newline="", encoding="utf-8")
             writer = csv.DictWriter(f, fieldnames=fields)
-            
-            # Write header if new/empty
-            if not path.exists() or path.stat().st_size == 0:
+            # Write header if file was new/empty
+            if write_header:
                 writer.writeheader()
-                
             self.files[name] = f
             self.writers[name] = writer
 
