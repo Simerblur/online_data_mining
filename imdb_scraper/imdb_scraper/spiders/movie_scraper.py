@@ -247,7 +247,7 @@ class ImdbSpider(scrapy.Spider):
         return all_links
 
     async def _scrape_movie_safe(self, url, retry_count=0):
-        """Wrapper that catches exceptions and returns items as a list. Handles cooldown retries."""
+        """Wrapper that catches exceptions and returns items as a list. Handles cooldown and browser errors."""
         max_retries = 3
         try:
             items = []
@@ -256,8 +256,19 @@ class ImdbSpider(scrapy.Spider):
             return items
         except Exception as e:
             error_str = str(e)
+
+            # Handle browser closed/disconnected errors - reconnect and retry
+            if 'closed' in error_str or 'Target page' in error_str or 'Browser' in error_str:
+                if retry_count < max_retries:
+                    self.logger.warning(f"Browser disconnected for {url}, reconnecting... (retry {retry_count + 1}/{max_retries})")
+                    await self._reconnect_browser()
+                    await asyncio.sleep(5)
+                    return await self._scrape_movie_safe(url, retry_count + 1)
+                else:
+                    self.logger.error(f"Max retries reached for {url} (browser errors)")
+
             # Handle Bright Data cooldown errors with retry
-            if 'cooldown' in error_str or 'no_peers' in error_str:
+            elif 'cooldown' in error_str or 'no_peers' in error_str:
                 if retry_count < max_retries:
                     wait_time = 30 * (retry_count + 1)  # 30s, 60s, 90s
                     self.logger.warning(f"Cooldown hit for {url}, waiting {wait_time}s (retry {retry_count + 1}/{max_retries})")
@@ -371,8 +382,9 @@ class ImdbSpider(scrapy.Spider):
                 await page.close()
 
         except Exception as e:
-            # Re-raise cooldown errors for retry handling in _scrape_movie_safe
-            if 'cooldown' in str(e) or 'no_peers' in str(e):
+            error_str = str(e)
+            # Re-raise retryable errors for handling in _scrape_movie_safe
+            if any(x in error_str for x in ['cooldown', 'no_peers', 'closed', 'Target page', 'Browser']):
                 raise
             self.logger.error(f"Error scraping {url}: {e}")
 
