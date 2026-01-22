@@ -36,7 +36,7 @@ class BoxOfficeMojoSpider(scrapy.Spider):
         'CONCURRENT_REQUESTS': 2,
     }
 
-    def __init__(self, max_movies=1000, imdb_db_path="", *args, **kwargs):
+    def __init__(self, max_movies=20000, imdb_db_path="", *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.max_movies = int(max_movies)
         self.movies_processed = 0

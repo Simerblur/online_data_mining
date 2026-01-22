@@ -51,6 +51,9 @@ BRIGHTDATA_PASS = "8xizh8sdpkq9"
 BRIGHTDATA_HOST = "brd.superproxy.io"
 BRIGHTDATA_PORT = "33335"  # Web Unlocker port
 
+# Bright Data Scraping Browser (CDP connection for anti-bot bypass)
+BRIGHTDATA_CDP_URL = "wss://brd-customer-hl_79cc5ce7-zone-scraping_browser4444:390f741dnqqu@brd.superproxy.io:9222"
+
 # Add country targeting (US recommended for IMDB)
 # Append -country-us to username for US IPs
 BRIGHTDATA_USER_WITH_COUNTRY = f"{BRIGHTDATA_USER}-country-us"

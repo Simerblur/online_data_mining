@@ -1,60 +1,61 @@
 # Author: Juliusz | Online Data Mining - Amsterdam UAS
 import asyncio
+import random
 import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
 
 import scrapy
+from playwright.async_api import async_playwright
 from imdb_scraper.items import MovieItem, ReviewItem
 from scrapy.selector import Selector
+from scrapy.http import HtmlResponse
 
 
 class ImdbSpider(scrapy.Spider):
-    # Scrapy Spider to collect movie data from IMDb.
-    #
-    # This spider performs the following actions:
-    # 1. Starts at the IMDb Advanced Search page, sorted by number of votes (popularity).
-    # 2. Uses Playwright (headless browser) to render the search results which use infinite scrolling.
-    # 3. Pagination: Manually calculates the 'start' parameter to visit subsequent pages (1-50, 51-100, etc.)
-    #    because the "Next" button is unreliable.
-    # 4. Extracts movie metadata (title, year, score, box office, cast, directors) from the search result items.
-    #        Note: To speed up scraping, we extract most data directly from the search result list
-    #        instead of visiting each movie page individually when possible.
-    # 5. Visits the Reviews page for each movie to collect user reviews.
+    """
+    IMDb Spider using Bright Data Scraping Browser via CDP.
+
+    Scraping Browser handles all anti-bot protection automatically.
+    We connect via WebSocket and control the browser directly.
+
+    Speed optimizations:
+    - Parallel movie scraping with multiple browser tabs (default: 5)
+    - Optional review skipping for faster runs
+    - Reduced delays between operations
+    """
 
     name = "movie_scraper"
     allowed_domains = ["imdb.com"]
 
-    # Configuration limits
-    max_movies = 10000
-    max_reviews_per_movie = 4  # Limit reviews to save time/bandwidth
+    max_movies = 20000
+    max_reviews_per_movie = 4
+    concurrent_pages = 3  # Number of parallel browser tabs (limited by Bright Data)
 
-    def __init__(self, max_movies=10000, *args, **kwargs):
-        # Initialize the spider with configurable limits.
-        #
-        # Args:
-        #     max_movies: Maximum number of movies to scrape (default 10000).
+    def __init__(self, max_movies=20000, concurrent_pages=3, skip_reviews=False, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.max_movies = int(max_movies)
+        self.concurrent_pages = int(concurrent_pages)
+        self.skip_reviews = skip_reviews in (True, 'true', 'True', '1', 1)
         self.movies_scraped = 0
         self.seen_movie_ids = set()
-
-        # Load already-scraped movie IDs from database to skip duplicates
+        self.browser = None
+        self.playwright = None
+        self._scrape_lock = asyncio.Lock()  # For thread-safe counter updates
         self._load_existing_movie_ids()
 
-    # Custom settings to integrate with Playwright and set headers
     custom_settings = {
-        'USER_AGENT': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'USER_AGENT': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'CONCURRENT_REQUESTS': 1,
+        # Disable scrapy-playwright - we use direct CDP
+        'DOWNLOAD_HANDLERS': {},
     }
 
     def _load_existing_movie_ids(self):
-        # Load movie IDs already in the database to skip re-scraping.
-        # This allows resuming scraping without duplicating data.
         db_path = Path(__file__).parent.parent.parent / "output" / "movies.db"
         if not db_path.exists():
             return
-
         try:
             conn = sqlite3.connect(db_path)
             cursor = conn.cursor()
@@ -62,381 +63,430 @@ class ImdbSpider(scrapy.Spider):
             existing_ids = {f"tt{row[0]:07d}" for row in cursor.fetchall()}
             conn.close()
             self.seen_movie_ids = existing_ids
-            # Note: We use the logger after spider is initialized, so just store count
             self._existing_count = len(existing_ids)
         except Exception:
-            pass  # If DB read fails, just start fresh
+            pass
 
-    async def start(self):
-        # Entry point for the spider.
-        # Generates the first request to the IMDb search page.
+    async def _get_browser(self):
+        """Connect to Bright Data Scraping Browser via CDP."""
+        if self.browser is None:
+            cdp_url = self.settings.get('BRIGHTDATA_CDP_URL')
+            self.logger.info("Connecting to Bright Data Scraping Browser...")
+            self.playwright = await async_playwright().start()
+            self.browser = await self.playwright.chromium.connect_over_cdp(cdp_url)
+            self.logger.info("Connected successfully!")
+        return self.browser
 
-        # Log how many movies we're skipping from previous runs
-        if hasattr(self, '_existing_count') and self._existing_count > 0:
-            self.logger.info(f"Skipping {self._existing_count} movies already in database")
+    async def _reconnect_browser(self):
+        """Reconnect browser after errors."""
+        if self.browser:
+            try:
+                await self.browser.close()
+            except:
+                pass
+        self.browser = None
+        await asyncio.sleep(2)
+        return await self._get_browser()
 
-        # Base URL for feature films sorted by popularity (vote count)
-        base_url = "https://www.imdb.com/search/title/?title_type=feature&sort=num_votes,desc"
-
+    def start_requests(self):
+        """Scrapy entry point - start the scraping process."""
         yield scrapy.Request(
-            base_url,
-            callback=self.parse_search_results,
-            meta={
-                'playwright': True,
-                'playwright_include_page': True,  # Keep page open to interact with it if needed
-                'playwright_page_goto_kwargs': {
-                    'wait_until': 'domcontentloaded',
-                    'timeout': 240000,
-                }
-            }
+            "https://www.imdb.com/search/title/?title_type=feature&sort=num_votes,desc",
+            callback=self.collect_and_scrape_movies,
+            dont_filter=True
         )
 
-    async def parse_search_results(self, response):
-        # Parses the search results page.
-        #
-        # This method:
-        # 1. Scrolls down to try and load lazy-loaded content.
-        # 2. Extracts movie data from the list.
-        # 3. Pagination: Calculates the URL for the next batch (page) of results.
-        
-        self.logger.info(f"Parsing search results from: {response.url}")
-        
-        page = response.meta.get('playwright_page')
-        if not page:
-            self.logger.error("No Playwright page object available!")
+    async def collect_and_scrape_movies(self, response):
+        """Main scraping method - collect movies via infinite scroll then scrape in parallel."""
+        if hasattr(self, '_existing_count') and self._existing_count > 0:
+            self.logger.info(f"Will skip {self._existing_count} movies already in database")
+
+        self.logger.info(f"Speed settings: {self.concurrent_pages} parallel tabs, skip_reviews={self.skip_reviews}")
+
+        # Collect all movie links using infinite scroll
+        movie_links = await self._collect_movies_with_infinite_scroll()
+
+        if not movie_links:
+            self.logger.error("No movies collected!")
             return
 
+        # Filter out already seen movies
+        urls_to_scrape = []
+        for link in movie_links:
+            if self.movies_scraped >= self.max_movies:
+                break
+            movie_id_match = re.search(r'/title/(tt\d+)/', link)
+            if movie_id_match:
+                movie_id = movie_id_match.group(1)
+                if movie_id in self.seen_movie_ids:
+                    continue
+                self.seen_movie_ids.add(movie_id)
+            full_url = f"https://www.imdb.com{link}" if link.startswith('/') else link
+            urls_to_scrape.append(full_url)
+
+        self.logger.info(f"Collected {len(movie_links)} movies, {len(urls_to_scrape)} new to scrape")
+
+        # Scrape movies sequentially (Bright Data rate limits prevent parallel scraping)
+        for i, url in enumerate(urls_to_scrape):
+            if self.movies_scraped >= self.max_movies:
+                self.logger.info(f"Reached max movies limit: {self.max_movies}")
+                break
+
+            # Scrape movie with retry on cooldown
+            items = await self._scrape_movie_safe(url)
+            for item in items:
+                yield item
+
+            # Progress logging every 10 movies
+            if (i + 1) % 10 == 0:
+                self.logger.info(f"Progress: {self.movies_scraped}/{self.max_movies} movies scraped")
+
+            # Delay between movies (Bright Data requires spacing)
+            await asyncio.sleep(random.uniform(3, 5))
+
+    async def _collect_movies_with_infinite_scroll(self):
+        """Load search page and click 'Load More' to collect all movie links."""
+        url = "https://www.imdb.com/search/title/?title_type=feature&sort=num_votes,desc"
+        all_movie_ids = set()
+        all_links = []
+
         try:
-            # Scroll to bottom to trigger any lazy loading mechanisms
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await asyncio.sleep(1)
+            browser = await self._get_browser()
+            page = await browser.new_page()
 
-            # NOTE: Previous versions attempted to click "Load More" buttons.
-            # We now rely on direct pagination via URL parameters for reliability,
-            # but we still scroll to ensure the current 50 items are rendered.
+            try:
+                self.logger.info(f"Loading search page: {url}")
+                await page.goto(url, timeout=120000, wait_until='domcontentloaded')
+                await asyncio.sleep(3)
 
-            # Get the fully rendered HTML content
-            content = await page.content()
-            selector = Selector(text=content)
+                # Calculate clicks needed
+                target_movies = self.max_movies + len(self.seen_movie_ids) + 100
+                max_clicks = (target_movies // 50) + 5
 
-            # Extract movie links. Selector targets the specific container for movie titles.
-            movie_links = selector.css('a.ipc-title-link-wrapper::attr(href)').getall()
-            self.logger.info(f"Found {len(movie_links)} total movie links on this page")
+                self.logger.info(f"Will click 'Load More' up to {max_clicks} times to get {target_movies} movies")
 
-            # Fallback: detailed XPath query if the primary CSS selector fails
-            if not movie_links:
-                movie_links = selector.xpath('//a[contains(@href, "/title/tt")]/@href').getall()
-                # Deduplicate links found via fallback
-                seen = set()
-                unique_links = []
-                for link in movie_links:
-                    match = re.search(r'(/title/tt\d+/)', link)
-                    if match and match.group(1) not in seen:
-                        seen.add(match.group(1))
-                        unique_links.append(link)
-                movie_links = unique_links
-                self.logger.info(f"Fallback xpath found: {len(movie_links)} links")
+                for click_num in range(max_clicks):
+                    # Scroll down first
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    await asyncio.sleep(1)
 
-            # Debugging: Save page if empty (helps identify bot protection/layout changes)
-            if not movie_links:
-                self.logger.warning(f"No movie links found on {response.url}")
-                with open('debug_response.html', 'w', encoding='utf-8') as f:
-                    f.write(content)
-                self.logger.info("Saved response to debug_response.html")
+                    # Get current movies
+                    content = await page.content()
+                    selector = Selector(text=content)
+                    links = selector.css('a.ipc-title-link-wrapper::attr(href)').getall()
 
-            # Queue extraction for each movie found
-            for link in movie_links:
-                if self.max_movies > 0 and self.movies_scraped >= self.max_movies:
-                    self.logger.info(f"Reached max movies: {self.movies_scraped}")
-                    break
+                    # Extract unique movie IDs
+                    new_count = 0
+                    for link in links:
+                        match = re.search(r'/title/(tt\d+)/', link)
+                        if match and match.group(1) not in all_movie_ids:
+                            all_movie_ids.add(match.group(1))
+                            all_links.append(link)
+                            new_count += 1
 
-                # Extract generic IMDb ID (tt1234567)
-                movie_id_match = re.search(r'/title/(tt\d+)/', link)
-                if movie_id_match:
-                    movie_id = movie_id_match.group(1)
-                    if movie_id in self.seen_movie_ids:
-                        continue
-                    self.seen_movie_ids.add(movie_id)
+                    # Log every 10 clicks to reduce noise
+                    if click_num % 10 == 0 or new_count > 0:
+                        self.logger.info(f"Click {click_num}: {len(all_links)} total movies (+{new_count} new)")
 
-                self.movies_scraped += 1
-                full_url = response.urljoin(link)
-                
-                # Yield request for movie details. 
-                # Use Playwright to ensure all metadata (data-testid) is rendered.
-                yield scrapy.Request(
-                    full_url,
-                    callback=self.parse_movie,
-                    meta={
-                        'playwright': True,
-                        'playwright_include_page': False,
-                        'playwright_context_kwargs': {
-                            'ignore_https_errors': True,
-                        },
-                    }
-                )
+                    # Check if we have enough
+                    if len(all_links) >= target_movies:
+                        self.logger.info(f"Collected enough movies: {len(all_links)}")
+                        break
 
-            # Pagination Logic
-            # IMDb lists 50 movies per page. We manually calculate the next 'start' index.
-            if self.max_movies == 0 or self.movies_scraped < self.max_movies:
-                # Find current start index from URL (default to 1)
-                current_start_match = re.search(r'start=(\d+)', response.url)
-                current_start = int(current_start_match.group(1)) if current_start_match else 1
-                
-                # Safety check: stop if we are looping on the same page without finding movies
-                if not movie_links:
-                    self.logger.warning(f"No new movies found on page start={current_start}. Stopping to avoid infinite loop.")
+                    # Check if Load More button exists and click via JavaScript
+                    prev_count = len(links)
+
+                    # Wait for button to appear (up to 5 seconds)
+                    btn_exists = False
+                    for _ in range(10):
+                        btn_exists = await page.evaluate('''() => {
+                            const btn = document.querySelector("button.ipc-see-more__button");
+                            if (btn) {
+                                btn.scrollIntoView({ behavior: "instant", block: "center" });
+                                return true;
+                            }
+                            return false;
+                        }''')
+                        if btn_exists:
+                            break
+                        await asyncio.sleep(0.5)
+
+                    if not btn_exists:
+                        self.logger.info("No 'Load More' button found after waiting")
+                        break
+
+                    # Click the button
+                    try:
+                        await asyncio.sleep(0.3)
+                        await page.evaluate('document.querySelector("button.ipc-see-more__button")?.click()')
+                    except Exception as e:
+                        self.logger.warning(f"JS click failed: {e}")
+                        break
+
+                    # Wait for new content - check every 300ms for up to 10 seconds
+                    for _ in range(33):
+                        await asyncio.sleep(0.3)
+                        new_content = await page.content()
+                        new_selector = Selector(text=new_content)
+                        new_links = new_selector.css('a.ipc-title-link-wrapper::attr(href)').getall()
+                        if len(new_links) > prev_count:
+                            break
+                    else:
+                        self.logger.warning("Timeout waiting for new content")
+
+                    # Minimal delay between clicks
+                    await asyncio.sleep(random.uniform(0.5, 1.0))
+
+            finally:
+                await page.close()
+
+        except Exception as e:
+            self.logger.error(f"Error collecting movies: {e}")
+            await self._reconnect_browser()
+
+        return all_links
+
+    async def _scrape_movie_safe(self, url, retry_count=0):
+        """Wrapper that catches exceptions and returns items as a list. Handles cooldown retries."""
+        max_retries = 3
+        try:
+            items = []
+            async for item in self._scrape_movie(url):
+                items.append(item)
+            return items
+        except Exception as e:
+            error_str = str(e)
+            # Handle Bright Data cooldown errors with retry
+            if 'cooldown' in error_str or 'no_peers' in error_str:
+                if retry_count < max_retries:
+                    wait_time = 30 * (retry_count + 1)  # 30s, 60s, 90s
+                    self.logger.warning(f"Cooldown hit for {url}, waiting {wait_time}s (retry {retry_count + 1}/{max_retries})")
+                    await asyncio.sleep(wait_time)
+                    return await self._scrape_movie_safe(url, retry_count + 1)
+                else:
+                    self.logger.error(f"Max retries reached for {url}")
+            else:
+                self.logger.error(f"Error scraping {url}: {e}")
+            return []
+
+    async def _scrape_movie(self, url):
+        """Scrape a single movie page."""
+        try:
+            browser = await self._get_browser()
+            page = await browser.new_page()
+
+            try:
+                await page.goto(url, timeout=45000, wait_until='domcontentloaded')
+
+                # Wait for the title element to appear (indicates page is loaded)
+                try:
+                    await page.wait_for_selector('span.hero__primary-text', timeout=10000)
+                except Exception:
+                    self.logger.warning(f"Title element not found on {url}, waiting...")
+                    await asyncio.sleep(3)
+
+                content = await page.content()
+                response = HtmlResponse(url=url, body=content.encode('utf-8'), encoding='utf-8')
+
+                item = MovieItem()
+
+                # Movie ID
+                imdb_id_match = re.search(r'/title/tt(\d+)/', url)
+                movie_id = int(imdb_id_match.group(1)) if imdb_id_match else None
+                item['movie_id'] = movie_id
+
+                # Title
+                item['title'] = response.css('span.hero__primary-text::text').get()
+
+                # Skip movies with no title (page didn't load properly)
+                if not item['title']:
+                    self.logger.warning(f"Skipping movie with no title: {url}")
                     return
 
-                # Calculate next page start (current + 50)
-                next_start = current_start + 50
-                
-                # Construct the next URL
-                if 'start=' in response.url:
-                    next_page = re.sub(r'start=\d+', f'start={next_start}', response.url)
+                # Year
+                year_text = response.xpath(
+                    '//ul[contains(@class, "ipc-inline-list")]//li//a[contains(@href, "releaseinfo")]/text()'
+                ).get()
+                if year_text:
+                    year_match = re.search(r'(\d{4})', year_text)
+                    item['year'] = int(year_match.group(1)) if year_match else None
                 else:
-                    next_page = f"{response.url}&start={next_start}"
+                    item['year'] = None
 
-                self.logger.info(f"Generated next page link: {next_page}")
-                
-                yield scrapy.Request(
-                    next_page,
-                    callback=self.parse_search_results,
-                    meta={
-                        'playwright': True,
-                        'playwright_include_page': False, # Page object not needed for next request until loaded
-                        'playwright_page_goto_kwargs': {
-                            'wait_until': 'domcontentloaded',
-                            'timeout': 240000,
-                        }
-                    }
-                )
+                # Rating
+                rating_text = response.css(
+                    'div[data-testid="hero-rating-bar__aggregate-rating__score"] span::text'
+                ).get()
+                try:
+                    item['user_score'] = float(rating_text) if rating_text else None
+                except ValueError:
+                    item['user_score'] = None
 
-        finally:
-            # Critical: Close the Playwright page to prevent memory leaks
-            await page.close()
+                # Box Office
+                item['box_office'] = self._extract_box_office(response)
 
-    def parse_movie(self, response):
-        # Extracts metadata from a single Movie page.
-        #
-        # Fields extracted:
-        # - ID, Title, Year
-        # - User Score (Rating)
-        # - Box Office (Worldwide Gross)
-        # - Genres, Directors, Cast
+                # Metadata
+                item['release_date'] = response.css(
+                    "li[data-testid='title-details-releasedate'] a.ipc-metadata-list-item__list-content-item::text"
+                ).get()
 
-        item = MovieItem()
+                runtime_text = response.css(
+                    "li[data-testid='title-techspec_runtime'] span.ipc-metadata-list-item__list-content-item::text"
+                ).get()
+                item['runtime_minutes'] = self._parse_runtime(runtime_text)
 
-        # Extract numeric ID
-        imdb_id_match = re.search(r'/title/tt(\d+)/', response.url)
-        movie_id = int(imdb_id_match.group(1)) if imdb_id_match else None
-        item['movie_id'] = movie_id
+                item['mpaa_rating'] = response.css('a[href*="parentalguide"]::text').get()
 
-        # Title
-        item['title'] = response.css('span.hero__primary-text::text').get()
+                item['production_companies'] = response.css(
+                    "li[data-testid='title-details-companies'] a.ipc-metadata-list-item__list-content-item::text"
+                ).getall()
 
-        # Release Year (found in the header inline list)
-        year_text = response.xpath(
-            '//ul[contains(@class, "ipc-inline-list")]'
-            '//li//a[contains(@href, "releaseinfo")]/text()'
-        ).get()
-        if year_text:
-            year_match = re.search(r'(\d{4})', year_text)
-            item['year'] = int(year_match.group(1)) if year_match else None
-        else:
-            item['year'] = None
+                # Genres
+                genres = response.css('div.ipc-chip-list__scroller a span::text').getall()
+                item['genres'] = ', '.join(genres) if genres else None
+                item['genres_list'] = genres if genres else []
 
-        # User Score
-        rating_text = response.css(
-            'div[data-testid="hero-rating-bar__aggregate-rating__score"] span::text'
-        ).get()
+                # Credits
+                item['directors'] = self._extract_credits_by_role(response, "Director")
+                item['writers'] = self._extract_credits_by_role(response, "Writer")
+                item['composers'] = self._extract_credits_by_role(response, "Music by")
+                item['cast'] = self._extract_cast(response)
+
+                item['scraped_at'] = datetime.now().isoformat()
+
+                # Thread-safe counter update
+                async with self._scrape_lock:
+                    self.movies_scraped += 1
+                    current_count = self.movies_scraped
+
+                self.logger.info(f"Scraped #{current_count}: {item['title']} ({item['year']})")
+                yield item
+
+                # Scrape reviews (unless skipped for speed)
+                if not self.skip_reviews and movie_id:
+                    async for review in self._scrape_reviews(movie_id):
+                        yield review
+
+            finally:
+                await page.close()
+
+        except Exception as e:
+            # Re-raise cooldown errors for retry handling in _scrape_movie_safe
+            if 'cooldown' in str(e) or 'no_peers' in str(e):
+                raise
+            self.logger.error(f"Error scraping {url}: {e}")
+
+    async def _scrape_reviews(self, movie_id):
+        """Scrape reviews for a movie."""
+        url = f'https://www.imdb.com/title/tt{movie_id:07d}/reviews/'
+
         try:
-            item['user_score'] = float(rating_text) if rating_text else None
-        except ValueError:
-            item['user_score'] = None
+            browser = await self._get_browser()
+            page = await browser.new_page()
 
-        # Box Office (Helper method used due to layout variations)
-        item['box_office'] = self._extract_box_office(response)
+            try:
+                await page.goto(url, timeout=30000, wait_until='domcontentloaded')
+                await asyncio.sleep(1)
 
-        # New Metadata Fields
-        item['release_date'] = response.css("li[data-testid='title-details-releasedate'] a.ipc-metadata-list-item__list-content-item::text").get()
-        
-        # Runtime
-        # Matches "2h 22m" in the span
-        runtime_text = response.css("li[data-testid='title-techspec_runtime'] span.ipc-metadata-list-item__list-content-item::text").get()
-        item['runtime_minutes'] = self._parse_runtime(runtime_text)
-        
-        # MPAA Rating
-        # Found in Hero section header: <a href="...parentalguide...">R</a>
-        item['mpaa_rating'] = response.css('a[href*="parentalguide"]::text').get()
-        
-        # Production Companies (List)
-        item['production_companies'] = response.css("li[data-testid='title-details-companies'] a.ipc-metadata-list-item__list-content-item::text").getall()
+                content = await page.content()
+                response = HtmlResponse(url=url, body=content.encode('utf-8'), encoding='utf-8')
 
-        # Genres
-        genres = response.css('div.ipc-chip-list__scroller a span::text').getall()
-        item['genres'] = ', '.join(genres) if genres else None
-        item['genres_list'] = genres if genres else []
+                reviews_scraped = 0
+                for container in response.css('article.user-review-item'):
+                    if reviews_scraped >= self.max_reviews_per_movie:
+                        break
 
-        # Directors & Cast (Helper methods)
-        item['directors'] = self._extract_credits_by_role(response, "Director")
-        item['writers'] = self._extract_credits_by_role(response, "Writer") # New
-        item['composers'] = self._extract_credits_by_role(response, "Music by") # New
-        item['cast'] = self._extract_cast(response)
+                    review = ReviewItem()
+                    review['movie_id'] = movie_id
+                    review['author'] = container.css('[data-testid="author-link"]::text').get()
+                    if not review['author']:
+                        review['author'] = container.css('a.ipc-link--base::text').get()
+                    review['score'] = container.css('span.ipc-rating-star--rating::text').get()
+                    text_parts = container.css('div.ipc-html-content-inner-div::text').getall()
+                    review['text'] = ' '.join(text_parts).strip() if text_parts else None
+                    review['is_critic'] = False
+                    review['review_date'] = container.css('.review-date::text').get()
+                    review['scraped_at'] = datetime.now().isoformat()
 
-        item['scraped_at'] = datetime.now().isoformat()
+                    if review['author'] or review['text']:
+                        reviews_scraped += 1
+                        yield review
 
-        yield item
+            finally:
+                await page.close()
 
-        # Follow link to User Reviews
-        full_tt_match = re.search(r'(tt\d+)', response.url)
-        if full_tt_match:
-            full_tt_id = full_tt_match.group(1)
-            reviews_url = f'https://www.imdb.com/title/{full_tt_id}/reviews/'
-            yield scrapy.Request(
-                reviews_url,
-                callback=self.parse_reviews,
-                meta={'movie_id': movie_id, 'playwright': False}
-            )
+        except Exception as e:
+            self.logger.warning(f"Error scraping reviews for {movie_id}: {e}")
 
     def _parse_runtime(self, text):
-        # Syntax Explanation: Parsing complex strings
-        # Tries to find "175 min" or "2h 55m" and convert to integer minutes.
         if not text:
             return None
-        
-        # Match '123 min'
         minutes_match = re.search(r'(\d+)\s*min', text)
         if minutes_match:
             return int(minutes_match.group(1))
-            
-        # Match '2 hours 55 minutes'
         h_match = re.search(r'(\d+)\s*h', text)
         m_match = re.search(r'(\d+)\s*m', text)
-        
         minutes = 0
         if h_match:
             minutes += int(h_match.group(1)) * 60
         if m_match:
             minutes += int(m_match.group(1))
-            
         return minutes if minutes > 0 else None
 
     def _extract_box_office(self, response):
-        # Helper to find the Box Office Gross.
-        # Checks multiple possible locations/XPaths as IMDb layout varies.
-        
-        box_office_value = None
-
-        # Strategy 1: Data-TestID (Specific Metadata Item)
-        box_office_section = response.xpath(
+        box_office_value = response.xpath(
             '//li[@data-testid="title-boxoffice-cumulativeworldwidegross"]'
             '//span[contains(@class, "ipc-metadata-list-item__list-content-item")]/text()'
         ).get()
-
-        if box_office_section:
-            box_office_value = box_office_section
-
-        # Strategy 2: Label search (Look for "Gross worldwide" text)
         if not box_office_value:
             box_office_value = response.xpath(
                 '//span[contains(text(), "Gross worldwide")]/following-sibling::span/text()'
             ).get()
-
-        # Strategy 3: Alternative Label search in list items
-        if not box_office_value:
-            box_office_value = response.xpath(
-                '//li[contains(., "Gross worldwide")]//span[@class="ipc-metadata-list-item__list-content-item"]/text()'
-            ).get()
-
         if box_office_value:
-            # Clean string: "$2,923,706,026" -> 2923706026
             cleaned = re.sub(r'[^\d]', '', box_office_value)
             if cleaned:
                 return int(cleaned)
-
         return None
 
     def _extract_credits_by_role(self, response, role_name):
-        # Helper to extract people credits (Directors, Writers, Composers) by role name.
-        # Syntax Explanation: Dynamic XPath construction
-        # We look for a list item (li) with the specific class and text content matching the role.
-        # This allows us to reuse logic for different roles.
-        
         credits = []
         seen_ids = set()
-
-        # Locate the specific section. Works for Director, Writer, Music by
-        # Handles "Director" vs "Directors" pluralization implicitly by partial match if needed, 
-        # but usually role headers are specific.
-        # We use a flexible XPath to find the label span with the text, then get the parent li.
-        
-        # Note: IMDb groups these under 'title-pc-principal-credit'
-        
         section = response.xpath(
-            f'//li[@data-testid="title-pc-principal-credit"]'
-            f'[.//span[contains(text(), "{role_name}")]]'
+            f'//li[@data-testid="title-pc-principal-credit"][.//span[contains(text(), "{role_name}")]]'
         )
-        
-        # If not found in principal credits, try extended credits list style (for less popular roles)
         if not section:
-             section = response.xpath(
-                f'//li[contains(@class, "ipc-metadata-list__item")]'
-                f'[.//span[contains(text(), "{role_name}")]]'
+            section = response.xpath(
+                f'//li[contains(@class, "ipc-metadata-list__item")][.//span[contains(text(), "{role_name}")]]'
             )
-
-        links = section.css('a[href*="/name/"]')
-        for link in links:
+        for link in section.css('a[href*="/name/"]'):
             name = link.css('::text').get()
             href = link.css('::attr(href)').get()
-
             person_id_match = re.search(r'/name/(nm\d+)/', href) if href else None
             imdb_person_id = person_id_match.group(1) if person_id_match else None
-
             if imdb_person_id and imdb_person_id in seen_ids:
                 continue
             if imdb_person_id:
                 seen_ids.add(imdb_person_id)
-
             if name:
-                credits.append({
-                    'name': name.strip(),
-                    'imdb_person_id': imdb_person_id
-                })
-
+                credits.append({'name': name.strip(), 'imdb_person_id': imdb_person_id})
         return credits
 
-    # Deprecated: _extract_directors (replaced by _extract_credits_by_role)
-
     def _extract_cast(self, response):
-        # Helper to extract Cast members (Actors) and their Roles.
         cast = []
         seen_ids = set()
-
-        cast_items = response.css('div[data-testid="title-cast-item"]')
-
-        # Limit to top 10 actors to keep data manageable
-        for order, item in enumerate(cast_items[:10], start=1):
+        for order, item in enumerate(response.css('div[data-testid="title-cast-item"]')[:10], start=1):
             actor_link = item.css('a[data-testid="title-cast-item__actor"]')
             actor_name = actor_link.css('::text').get()
             actor_href = actor_link.css('::attr(href)').get()
-
             person_id_match = re.search(r'/name/(nm\d+)/', actor_href) if actor_href else None
             imdb_person_id = person_id_match.group(1) if person_id_match else None
-
             if imdb_person_id and imdb_person_id in seen_ids:
                 continue
             if imdb_person_id:
                 seen_ids.add(imdb_person_id)
-
-            # Character Name (often nested differently)
-            character_name = item.css(
-                'a[data-testid="cast-item-characters-link"] span::text'
-            ).get()
+            character_name = item.css('a[data-testid="cast-item-characters-link"] span::text').get()
             if not character_name:
-                character_name = item.css(
-                    'span[data-testid="cast-item-characters-link"] span::text'
-                ).get()
-
+                character_name = item.css('span[data-testid="cast-item-characters-link"] span::text').get()
             if actor_name:
                 cast.append({
                     'name': actor_name.strip(),
@@ -444,41 +494,12 @@ class ImdbSpider(scrapy.Spider):
                     'character_name': character_name.strip() if character_name else None,
                     'cast_order': order
                 })
-
         return cast
 
-    def parse_reviews(self, response):
-        # Extracts User Reviews from the reviews page.
-        movie_id = response.meta.get('movie_id')
-        reviews_scraped = 0
-
-        review_containers = response.css('article.user-review-item')
-
-        for container in review_containers:
-            if reviews_scraped >= self.max_reviews_per_movie:
-                break
-
-            review = ReviewItem()
-            review['movie_id'] = movie_id
-            
-            # Author Name
-            review['author'] = container.css('[data-testid="author-link"]::text').get()
-            if not review['author']:
-                review['author'] = container.css('a.ipc-link--base::text').get()
-
-            # Rating Score
-            score_text = container.css('span.ipc-rating-star--rating::text').get()
-            review['score'] = score_text
-
-            # Review Body
-            text_parts = container.css('div.ipc-html-content-inner-div::text').getall()
-            review['text'] = ' '.join(text_parts).strip() if text_parts else None
-
-            review['is_critic'] = False
-            review['review_date'] = container.css('.review-date::text').get()
-            review['scraped_at'] = datetime.now().isoformat()
-
-            if review['author'] or review['text']:
-                reviews_scraped += 1
-                yield review
-
+    async def closed(self, reason):
+        """Clean up browser on spider close."""
+        if self.browser:
+            await self.browser.close()
+        if self.playwright:
+            await self.playwright.stop()
+        self.logger.info(f"Spider closed: {reason}. Total movies scraped: {self.movies_scraped}")
