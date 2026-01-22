@@ -29,11 +29,24 @@ class ImdbSpider(scrapy.Spider):
     name = "movie_scraper"
     allowed_domains = ["imdb.com"]
 
+    # Configuration for targeting the number of movies to scrape
     max_movies = 20000
+
+    # Limit reviews per movie to keep scraping fast; can be increased for more depth
     max_reviews_per_movie = 4
-    concurrent_pages = 3  # Number of parallel browser tabs (limited by Bright Data)
+
+    # Number of parallel browser tabs (limited by Bright Data plan capacity)
+    concurrent_pages = 3
 
     def __init__(self, max_movies=20000, concurrent_pages=3, skip_reviews=False, *args, **kwargs):
+        """
+        Initialize the spider with custom arguments.
+
+        Args:
+            max_movies: Target total number of movies to scrape.
+            concurrent_pages: Number of browser tabs to run in parallel.
+            skip_reviews: If True, skips scraping user reviews to speed up data collection.
+        """
         super().__init__(*args, **kwargs)
         self.max_movies = int(max_movies)
         self.concurrent_pages = int(concurrent_pages)
@@ -42,17 +55,21 @@ class ImdbSpider(scrapy.Spider):
         self.seen_movie_ids = set()
         self.browser = None
         self.playwright = None
-        self._scrape_lock = asyncio.Lock()  # For thread-safe counter updates
+        self._scrape_lock = asyncio.Lock()  # Ensures thread-safe updates to shared counters
         self._load_existing_movie_ids()
 
     custom_settings = {
         'USER_AGENT': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'CONCURRENT_REQUESTS': 1,
-        # Disable scrapy-playwright - we use direct CDP
+        # Disable standard scrapy-playwright integration as we use direct CDP connection
         'DOWNLOAD_HANDLERS': {},
     }
 
     def _load_existing_movie_ids(self):
+        """
+        Load existing movie IDs from the local SQLite database to avoid duplicates.
+        This prevents re-scraping movies we already have data for.
+        """
         db_path = Path(__file__).parent.parent.parent / "output" / "movies.db"
         if not db_path.exists():
             return
@@ -60,6 +77,7 @@ class ImdbSpider(scrapy.Spider):
             conn = sqlite3.connect(db_path)
             cursor = conn.cursor()
             cursor.execute("SELECT movie_id FROM movie")
+            # Format IDs as 'tt1234567' for easy comparison
             existing_ids = {f"tt{row[0]:07d}" for row in cursor.fetchall()}
             conn.close()
             self.seen_movie_ids = existing_ids
@@ -68,7 +86,10 @@ class ImdbSpider(scrapy.Spider):
             pass
 
     async def _get_browser(self):
-        """Connect to Bright Data Scraping Browser via CDP."""
+        """
+        Connect to or retrieve the active Bright Data Scraping Browser instance via CDP (Chrome DevTools Protocol).
+        This single browser instance manages multiple tabs.
+        """
         if self.browser is None:
             cdp_url = self.settings.get('BRIGHTDATA_CDP_URL')
             self.logger.info("Connecting to Bright Data Scraping Browser...")
@@ -78,7 +99,10 @@ class ImdbSpider(scrapy.Spider):
         return self.browser
 
     async def _reconnect_browser(self):
-        """Reconnect browser after errors."""
+        """
+        Handle browser disconnections by properly closing and re-initializing the connection.
+        Useful when the remote browser session times out or errors.
+        """
         if self.browser:
             try:
                 await self.browser.close()
@@ -89,7 +113,9 @@ class ImdbSpider(scrapy.Spider):
         return await self._get_browser()
 
     def start_requests(self):
-        """Scrapy entry point - start the scraping process."""
+        """
+        Entry point for Scrapy. Starts the process by requesting the main IMDb search page.
+        """
         yield scrapy.Request(
             "https://www.imdb.com/search/title/?title_type=feature&sort=num_votes,desc",
             callback=self.collect_and_scrape_movies,
@@ -97,20 +123,25 @@ class ImdbSpider(scrapy.Spider):
         )
 
     async def collect_and_scrape_movies(self, response):
-        """Main scraping method - collect movies via infinite scroll then scrape in parallel."""
+        """
+        Main orchestration method:
+        1. Collects a large list of movie URLs using infinite scroll.
+        2. Filters out movies that are already in the database.
+        3. Scrapes the remaining movies sequentially (due to rate limits).
+        """
         if hasattr(self, '_existing_count') and self._existing_count > 0:
             self.logger.info(f"Will skip {self._existing_count} movies already in database")
 
         self.logger.info(f"Speed settings: {self.concurrent_pages} parallel tabs, skip_reviews={self.skip_reviews}")
 
-        # Collect all movie links using infinite scroll
+        # Step 1: Collect movie links
         movie_links = await self._collect_movies_with_infinite_scroll()
 
         if not movie_links:
             self.logger.error("No movies collected!")
             return
 
-        # Filter out already seen movies
+        # Step 2: Filter duplicates
         urls_to_scrape = []
         for link in movie_links:
             if self.movies_scraped >= self.max_movies:
@@ -118,6 +149,7 @@ class ImdbSpider(scrapy.Spider):
             movie_id_match = re.search(r'/title/(tt\d+)/', link)
             if movie_id_match:
                 movie_id = movie_id_match.group(1)
+                # Check against in-memory set of existing IDs
                 if movie_id in self.seen_movie_ids:
                     continue
                 self.seen_movie_ids.add(movie_id)
@@ -126,13 +158,13 @@ class ImdbSpider(scrapy.Spider):
 
         self.logger.info(f"Collected {len(movie_links)} movies, {len(urls_to_scrape)} new to scrape")
 
-        # Scrape movies sequentially (Bright Data rate limits prevent parallel scraping)
+        # Step 3: Scrape details
+        # We iterate through the list and scrape each movie.
         for i, url in enumerate(urls_to_scrape):
             if self.movies_scraped >= self.max_movies:
                 self.logger.info(f"Reached max movies limit: {self.max_movies}")
                 break
 
-            # Scrape movie with retry on cooldown
             items = await self._scrape_movie_safe(url)
             for item in items:
                 yield item
@@ -141,11 +173,14 @@ class ImdbSpider(scrapy.Spider):
             if (i + 1) % 10 == 0:
                 self.logger.info(f"Progress: {self.movies_scraped}/{self.max_movies} movies scraped")
 
-            # Delay between movies (Bright Data requires spacing)
+            # Introduce delay to respect Bright Data rate limits and avoid blocking
             await asyncio.sleep(random.uniform(3, 5))
 
     async def _collect_movies_with_infinite_scroll(self):
-        """Load search page and click 'Load More' to collect all movie links."""
+        """
+        Navigates to the search page and repeatedly clicks 'Load More' to load movie entries.
+        This is necessary because IMDb uses dynamic loading instead of standard pagination.
+        """
         url = "https://www.imdb.com/search/title/?title_type=feature&sort=num_votes,desc"
         all_movie_ids = set()
         all_links = []
@@ -159,23 +194,23 @@ class ImdbSpider(scrapy.Spider):
                 await page.goto(url, timeout=120000, wait_until='domcontentloaded')
                 await asyncio.sleep(3)
 
-                # Calculate clicks needed
+                # Estimate how many clicks we need based on target count (approx 50 movies per load)
                 target_movies = self.max_movies + len(self.seen_movie_ids) + 100
                 max_clicks = (target_movies // 50) + 5
 
                 self.logger.info(f"Will click 'Load More' up to {max_clicks} times to get {target_movies} movies")
 
                 for click_num in range(max_clicks):
-                    # Scroll down first
+                    # Scroll to bottom to trigger any lazy loading or visibility of the button
                     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                     await asyncio.sleep(1)
 
-                    # Get current movies
+                    # Extract current list of movies
                     content = await page.content()
                     selector = Selector(text=content)
                     links = selector.css('a.ipc-title-link-wrapper::attr(href)').getall()
 
-                    # Extract unique movie IDs
+                    # Deduplicate and store new links
                     new_count = 0
                     for link in links:
                         match = re.search(r'/title/(tt\d+)/', link)
@@ -184,21 +219,18 @@ class ImdbSpider(scrapy.Spider):
                             all_links.append(link)
                             new_count += 1
 
-                    # Log every 10 clicks to reduce noise
                     if click_num % 10 == 0 or new_count > 0:
                         self.logger.info(f"Click {click_num}: {len(all_links)} total movies (+{new_count} new)")
 
-                    # Check if we have enough
                     if len(all_links) >= target_movies:
                         self.logger.info(f"Collected enough movies: {len(all_links)}")
                         break
 
-                    # Check if Load More button exists and click via JavaScript
+                    # Helper logic to find and click the 'Load More' button
                     prev_count = len(links)
-
-                    # Wait for button to appear (up to 5 seconds)
                     btn_exists = False
                     for _ in range(10):
+                        # Use JS to check for button existence and scroll it into view
                         btn_exists = await page.evaluate('''() => {
                             const btn = document.querySelector("button.ipc-see-more__button");
                             if (btn) {
@@ -215,7 +247,7 @@ class ImdbSpider(scrapy.Spider):
                         self.logger.info("No 'Load More' button found after waiting")
                         break
 
-                    # Click the button
+                    # Click the button using JS for reliability
                     try:
                         await asyncio.sleep(0.3)
                         await page.evaluate('document.querySelector("button.ipc-see-more__button")?.click()')
@@ -223,8 +255,8 @@ class ImdbSpider(scrapy.Spider):
                         self.logger.warning(f"JS click failed: {e}")
                         break
 
-                    # Wait for new content - check every 300ms for up to 10 seconds
-                    for _ in range(33):
+                    # Wait for new content to load by observing list length increase
+                    for _ in range(33): # Wait approx 10 seconds
                         await asyncio.sleep(0.3)
                         new_content = await page.content()
                         new_selector = Selector(text=new_content)
@@ -234,7 +266,7 @@ class ImdbSpider(scrapy.Spider):
                     else:
                         self.logger.warning("Timeout waiting for new content")
 
-                    # Minimal delay between clicks
+                    # Small jitter to mimic human behavior
                     await asyncio.sleep(random.uniform(0.5, 1.0))
 
             finally:
@@ -247,7 +279,10 @@ class ImdbSpider(scrapy.Spider):
         return all_links
 
     async def _scrape_movie_safe(self, url, retry_count=0):
-        """Wrapper that catches exceptions and returns items as a list. Handles cooldown and browser errors."""
+        """
+        Safely scrapes a movie URL with robust error handling and retries.
+        catches browser disconnections and rate limit cooldowns.
+        """
         max_retries = 3
         try:
             items = []
@@ -257,7 +292,7 @@ class ImdbSpider(scrapy.Spider):
         except Exception as e:
             error_str = str(e)
 
-            # Handle browser closed/disconnected errors - reconnect and retry
+            # Retry logic for browser connection issues
             if 'closed' in error_str or 'Target page' in error_str or 'Browser' in error_str:
                 if retry_count < max_retries:
                     self.logger.warning(f"Browser disconnected for {url}, reconnecting... (retry {retry_count + 1}/{max_retries})")
@@ -267,10 +302,10 @@ class ImdbSpider(scrapy.Spider):
                 else:
                     self.logger.error(f"Max retries reached for {url} (browser errors)")
 
-            # Handle Bright Data cooldown errors with retry
+            # Retry logic for specific provider 'cooldown' errors
             elif 'cooldown' in error_str or 'no_peers' in error_str:
                 if retry_count < max_retries:
-                    wait_time = 30 * (retry_count + 1)  # 30s, 60s, 90s
+                    wait_time = 30 * (retry_count + 1)  # Exponential-ish backoff: 30s, 60s, 90s
                     self.logger.warning(f"Cooldown hit for {url}, waiting {wait_time}s (retry {retry_count + 1}/{max_retries})")
                     await asyncio.sleep(wait_time)
                     return await self._scrape_movie_safe(url, retry_count + 1)
@@ -281,15 +316,18 @@ class ImdbSpider(scrapy.Spider):
             return []
 
     async def _scrape_movie(self, url):
-        """Scrape a single movie page."""
+        """
+        Scrapes a single movie details page including metadata and credits.
+        """
         try:
             browser = await self._get_browser()
             page = await browser.new_page()
 
             try:
+                # Long timeout because some proxy nodes can be slow
                 await page.goto(url, timeout=45000, wait_until='domcontentloaded')
 
-                # Wait for the title element to appear (indicates page is loaded)
+                # Wait for the main title to ensure core content is loaded
                 try:
                     await page.wait_for_selector('span.hero__primary-text', timeout=10000)
                 except Exception:
@@ -301,20 +339,20 @@ class ImdbSpider(scrapy.Spider):
 
                 item = MovieItem()
 
-                # Movie ID
+                # Extract Movie ID from URL
                 imdb_id_match = re.search(r'/title/tt(\d+)/', url)
                 movie_id = int(imdb_id_match.group(1)) if imdb_id_match else None
                 item['movie_id'] = movie_id
 
-                # Title
+                # Extract Title
                 item['title'] = response.css('span.hero__primary-text::text').get()
 
-                # Skip movies with no title (page didn't load properly)
+                # Validation: Skip if title is missing (bad load)
                 if not item['title']:
                     self.logger.warning(f"Skipping movie with no title: {url}")
                     return
 
-                # Year
+                # Extract Year
                 year_text = response.xpath(
                     '//ul[contains(@class, "ipc-inline-list")]//li//a[contains(@href, "releaseinfo")]/text()'
                 ).get()
@@ -324,7 +362,7 @@ class ImdbSpider(scrapy.Spider):
                 else:
                     item['year'] = None
 
-                # Rating
+                # Extract User Rating
                 rating_text = response.css(
                     'div[data-testid="hero-rating-bar__aggregate-rating__score"] span::text'
                 ).get()
@@ -333,10 +371,10 @@ class ImdbSpider(scrapy.Spider):
                 except ValueError:
                     item['user_score'] = None
 
-                # Box Office
+                # Extract Box Office (using helper)
                 item['box_office'] = self._extract_box_office(response)
 
-                # Metadata
+                # Extract Metadata
                 item['release_date'] = response.css(
                     "li[data-testid='title-details-releasedate'] a.ipc-metadata-list-item__list-content-item::text"
                 ).get()
@@ -352,12 +390,12 @@ class ImdbSpider(scrapy.Spider):
                     "li[data-testid='title-details-companies'] a.ipc-metadata-list-item__list-content-item::text"
                 ).getall()
 
-                # Genres
+                # Extract Genres
                 genres = response.css('div.ipc-chip-list__scroller a span::text').getall()
                 item['genres'] = ', '.join(genres) if genres else None
                 item['genres_list'] = genres if genres else []
 
-                # Credits
+                # Extract Credits
                 item['directors'] = self._extract_credits_by_role(response, "Director")
                 item['writers'] = self._extract_credits_by_role(response, "Writer")
                 item['composers'] = self._extract_credits_by_role(response, "Music by")
@@ -365,7 +403,7 @@ class ImdbSpider(scrapy.Spider):
 
                 item['scraped_at'] = datetime.now().isoformat()
 
-                # Thread-safe counter update
+                # Thread-safe counter update for progress tracking
                 async with self._scrape_lock:
                     self.movies_scraped += 1
                     current_count = self.movies_scraped
@@ -373,7 +411,7 @@ class ImdbSpider(scrapy.Spider):
                 self.logger.info(f"Scraped #{current_count}: {item['title']} ({item['year']})")
                 yield item
 
-                # Scrape reviews (unless skipped for speed)
+                # Optionally scrape reviews if configured
                 if not self.skip_reviews and movie_id:
                     async for review in self._scrape_reviews(movie_id):
                         yield review
@@ -383,13 +421,15 @@ class ImdbSpider(scrapy.Spider):
 
         except Exception as e:
             error_str = str(e)
-            # Re-raise retryable errors for handling in _scrape_movie_safe
+            # Re-raise known recoverable errors to be handled by the safe wrapper
             if any(x in error_str for x in ['cooldown', 'no_peers', 'closed', 'Target page', 'Browser']):
                 raise
             self.logger.error(f"Error scraping {url}: {e}")
 
     async def _scrape_reviews(self, movie_id):
-        """Scrape reviews for a movie."""
+        """
+        Navigates to the reviews sub-page and scrapes user reviews.
+        """
         url = f'https://www.imdb.com/title/tt{movie_id:07d}/reviews/'
 
         try:
@@ -410,10 +450,14 @@ class ImdbSpider(scrapy.Spider):
 
                     review = ReviewItem()
                     review['movie_id'] = movie_id
+                    
+                    # Author and Score extraction
                     review['author'] = container.css('[data-testid="author-link"]::text').get()
                     if not review['author']:
                         review['author'] = container.css('a.ipc-link--base::text').get()
                     review['score'] = container.css('span.ipc-rating-star--rating::text').get()
+                    
+                    # Review Text
                     text_parts = container.css('div.ipc-html-content-inner-div::text').getall()
                     review['text'] = ' '.join(text_parts).strip() if text_parts else None
                     review['is_critic'] = False
@@ -431,6 +475,7 @@ class ImdbSpider(scrapy.Spider):
             self.logger.warning(f"Error scraping reviews for {movie_id}: {e}")
 
     def _parse_runtime(self, text):
+        """Converts runtime string (e.g., '2h 15m') to total minutes."""
         if not text:
             return None
         minutes_match = re.search(r'(\d+)\s*min', text)
@@ -446,6 +491,7 @@ class ImdbSpider(scrapy.Spider):
         return minutes if minutes > 0 else None
 
     def _extract_box_office(self, response):
+        """Extracts box office gross, handling different layouts."""
         box_office_value = response.xpath(
             '//li[@data-testid="title-boxoffice-cumulativeworldwidegross"]'
             '//span[contains(@class, "ipc-metadata-list-item__list-content-item")]/text()'
@@ -461,6 +507,10 @@ class ImdbSpider(scrapy.Spider):
         return None
 
     def _extract_credits_by_role(self, response, role_name):
+        """
+        Extracts people (directors, writers, etc.) based on the role label.
+        Handles IMDb's metadata list structure.
+        """
         credits = []
         seen_ids = set()
         section = response.xpath(
@@ -484,6 +534,7 @@ class ImdbSpider(scrapy.Spider):
         return credits
 
     def _extract_cast(self, response):
+        """Extracts the top 10 cast members."""
         cast = []
         seen_ids = set()
         for order, item in enumerate(response.css('div[data-testid="title-cast-item"]')[:10], start=1):
@@ -492,13 +543,16 @@ class ImdbSpider(scrapy.Spider):
             actor_href = actor_link.css('::attr(href)').get()
             person_id_match = re.search(r'/name/(nm\d+)/', actor_href) if actor_href else None
             imdb_person_id = person_id_match.group(1) if person_id_match else None
+            
             if imdb_person_id and imdb_person_id in seen_ids:
                 continue
             if imdb_person_id:
                 seen_ids.add(imdb_person_id)
+                
             character_name = item.css('a[data-testid="cast-item-characters-link"] span::text').get()
             if not character_name:
                 character_name = item.css('span[data-testid="cast-item-characters-link"] span::text').get()
+                
             if actor_name:
                 cast.append({
                     'name': actor_name.strip(),
@@ -509,7 +563,10 @@ class ImdbSpider(scrapy.Spider):
         return cast
 
     async def closed(self, reason):
-        """Clean up browser on spider close."""
+        """
+        Clean up resources when the spider finishes.
+        Ensures the Playwright browser connection is closed properly.
+        """
         if self.browser:
             await self.browser.close()
         if self.playwright:
