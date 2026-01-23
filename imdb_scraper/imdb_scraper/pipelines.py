@@ -44,7 +44,7 @@ class CsvPipeline:
             "imdb_movie_composers": ["movie_id", "composer_id"],
 
             # Metacritic & Box Office
-            "metacritic_data": ["movie_id", "metacritic_slug", "metascore", "metacritic_user_score", "critic_review_count", "user_rating_count", "scraped_at"],
+            "metacritic_data": ["movie_id", "metacritic_url", "metacritic_slug", "title_on_site", "metascore", "user_score", "critic_review_count", "user_rating_count", "scraped_at"],
             "metacritic_critic_reviews": ["critic_review_id", "movie_id", "publication_name", "critic_name", "score", "review_date", "excerpt", "scraped_at"],
             "metacritic_user_reviews": ["user_review_id", "movie_id", "username", "score", "review_date", "review_text", "scraped_at"],
             "box_office_data": ["movie_id", "production_budget", "domestic_opening", "domestic_total", "international_total", "worldwide_total", "domestic_distributor", "scraped_at"]
@@ -283,7 +283,7 @@ class SqlitePipeline:
             CREATE TABLE IF NOT EXISTS movie_cast (movie_id INTEGER REFERENCES movie, actor_id INTEGER REFERENCES actor, character_name TEXT, cast_order INTEGER, PRIMARY KEY (movie_id, actor_id));
 
             -- Metacritic
-            CREATE TABLE IF NOT EXISTS metacritic_data (movie_id INTEGER PRIMARY KEY REFERENCES movie, metacritic_slug TEXT, metascore INTEGER, metacritic_user_score REAL, critic_review_count INTEGER, user_rating_count INTEGER, scraped_at TEXT);
+            CREATE TABLE IF NOT EXISTS metacritic_data (movie_id INTEGER PRIMARY KEY REFERENCES movie, metacritic_url TEXT, metacritic_slug TEXT, title_on_site TEXT, metascore INTEGER, user_score REAL, critic_review_count INTEGER, user_rating_count INTEGER, scraped_at TEXT);
             CREATE TABLE IF NOT EXISTS metacritic_critic_review (critic_review_id INTEGER PRIMARY KEY, movie_id INTEGER REFERENCES movie, publication_name TEXT, critic_name TEXT, score INTEGER, review_date TEXT, excerpt TEXT, scraped_at TEXT);
             CREATE TABLE IF NOT EXISTS metacritic_user_review (user_review_id INTEGER PRIMARY KEY, movie_id INTEGER REFERENCES movie, username TEXT, score INTEGER, review_date TEXT, review_text TEXT, scraped_at TEXT);
             
