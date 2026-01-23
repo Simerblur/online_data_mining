@@ -89,9 +89,11 @@ class MetacriticSpider(scrapy.Spider):  # This defines our custom spider class t
         # Connects to the SQLite database file to query data.
         conn = sqlite3.connect(self.imdb_db_path)  # Open a connection to the SQLite database file.
         cursor = conn.cursor()  # Create a cursor object to execute SQL queries on the database.
-        cursor.execute("""  # Execute a SQL query to select movie data.
+        # Execute a SQL query to select movie data.
+        # The query gets movie ID, title, and year, sorted by ID, limited to max_movies.
+        cursor.execute("""
             SELECT movie_id, title, year FROM movie ORDER BY movie_id LIMIT ?
-        """, (self.max_movies,))  # The query gets movie ID, title, and year, sorted by ID, limited to max_movies.
+        """, (self.max_movies,))
         movies = cursor.fetchall()  # Fetch all the results from the query as a list of tuples.
         # Always close database connections to release file locks.
         conn.close()  # Close the database connection to free up resources and allow other programs to access the file.
