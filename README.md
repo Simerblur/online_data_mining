@@ -6,9 +6,10 @@ Online Data Mining Project for MDDB 2025-2026 at Amsterdam University of Applied
 
 | Name | Responsibility |
 |------|----------------|
-| Juliusz | IMDb scraper: infinite scroll pagination, movie/cast/director/review extraction, normalized 8-table schema, CSV/SQLite pipelines, Scrapy settings optimization (proxy config, Playwright integration, concurrency tuning, timeout handling) |
-| Jeffrey | Metacritic scraper: critic/user reviews, metascores, search-based movie matching, slug conversion |
-| Lin | Box Office Mojo scraper: financial data extraction, budget/gross revenue collection, IMDB ID format discovery |
+| Juliusz | IMDb scraper: infinite scroll pagination, movie/cast/director/review extraction, normalized 8-table schema, CSV/SQLite pipelines, Scrapy settings optimization (proxy config, Playwright integration, concurrency tuning, timeout handling,)ERD co-creation |  |
+| Jeffrey | Metacritic scraper: critic/user reviews, metascores, search-based movie matching, slug conversion, video editing of presentation, ERD co-creation | 
+| Lin | Box Office Mojo scraper: financial data extraction, budget/gross revenue collection, IMDB ID format discovery, ERD co-creation |
+| Dennis | Rotten Tomatoes scraper: user reviews, expert reviews scraping 
 
 ## Key Scraping Strategies
 
@@ -46,9 +47,17 @@ Online Data Mining Project for MDDB 2025-2026 at Amsterdam University of Applied
 - **AutoThrottle**: Dynamic delay adjustment (0.25s-5s) based on server response times
 - **Retry logic**: Auto-retry on 500/502/503/504/408/429 errors with 2 attempts
 
+------------------
+# Business Case & Morge
+## To learn more about our business case, we made an entire seperate file consisting out of our business case as Disney, a real scientific research about movie succes and much more! Go check out the assignment_disney_information_business file. 
+Here you can read some basic info about our case:
+
 ## Business Case
 
 We position ourselves as a movie publishing company that needs to make strategic decisions about which movies to produce. To make informed decisions we need data about what makes movies successful.
+
+## Business Question
+**Which factors are associated with box office success of movies, and how can Disney use this information in a structured way to improve portfolio and release decisions?**
 
 ## Research Question
 
@@ -59,8 +68,9 @@ What is the relationship between critic reviews, audience reviews, and box offic
 | Data | Source | Spider |
 |------|--------|--------|
 | Movie info, cast, directors | IMDb | `movie_scraper` |
-| User reviews | IMDb | `movie_scraper` |
-| Metascores, critic reviews | Metacritic | `metacritic_scraper` |
+| User reviews | IMDb, Metascores, Rotten Tomatoes | `movie_scraper` |
+| Metascores, | Metacritic | `metacritic_scraper` |
+| critic reviews, | Metacritic, Rotten tomatoes| `metacritic_scraper, rotten tomatoes scraper` |
 | Box office financials | Box Office Mojo | `boxoffice_scraper` |
 
 ## Database Schema
@@ -79,6 +89,9 @@ What is the relationship between critic reviews, audience reviews, and box offic
 
 ### Box Office Table
 - `box_office_data` - Budget, domestic/international/worldwide gross
+
+### Rotten Tomatoes Table
+- `rottentomatoes_critic_reviews` / `rottentomatoes_user_reviews` - User reviews & Critic reviews
 
 ## Installation
 
