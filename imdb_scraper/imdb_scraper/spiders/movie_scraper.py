@@ -194,6 +194,24 @@ class ImdbSpider(scrapy.Spider):
                 await page.goto(url, timeout=120000, wait_until='domcontentloaded')
                 await asyncio.sleep(3)
 
+                # Wait for body and movie list to be available
+                try:
+                    await page.wait_for_selector('body', timeout=30000)
+                    await page.wait_for_selector('a.ipc-title-link-wrapper', timeout=30000)
+                except Exception as e:
+                    self.logger.warning(f"Wait for selectors failed: {e}")
+
+                # Extract initial movies before scrolling (in case scroll fails)
+                content = await page.content()
+                selector = Selector(text=content)
+                initial_links = selector.css('a.ipc-title-link-wrapper::attr(href)').getall()
+                for link in initial_links:
+                    match = re.search(r'/title/(tt\d+)/', link)
+                    if match and match.group(1) not in all_movie_ids:
+                        all_movie_ids.add(match.group(1))
+                        all_links.append(link)
+                self.logger.info(f"Initial page load: {len(all_links)} movies found")
+
                 # Estimate how many clicks we need based on target count (approx 50 movies per load)
                 target_movies = self.max_movies + len(self.seen_movie_ids) + 100
                 max_clicks = (target_movies // 50) + 5
@@ -202,7 +220,11 @@ class ImdbSpider(scrapy.Spider):
 
                 for click_num in range(max_clicks):
                     # Scroll to bottom to trigger any lazy loading or visibility of the button
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    try:
+                        await page.evaluate("document.body && window.scrollTo(0, document.body.scrollHeight)")
+                    except Exception as scroll_err:
+                        self.logger.warning(f"Scroll failed: {scroll_err}")
+                        break
                     await asyncio.sleep(1)
 
                     # Extract current list of movies
